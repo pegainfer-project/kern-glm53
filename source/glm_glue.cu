@@ -12,7 +12,10 @@
 //   - the indexer key (LayerNorm, interleaved rope on its first 64 dims) and query quantized in f32
 //     with eps 1e-4, the key cached as e4m3 bytes and one f32 scale.
 // Paged index cache, page-blocked as vLLM's: page p holds 64 rows of 128 e4m3 bytes, then their 64
-// f32 scales (132 bytes a token). The latent cache is [slot][576] bf16: kv_norm | roped k_pe.
+// f32 scales (132 bytes a token). The latent cache row is kv_norm | roped k_pe, either [576] bf16 or
+// SGLang's fp8 one (its DSA backend's quantize_k_cache, 656 bytes): kv_norm as 512 e4m3 in four tiles
+// of 128, each tile's f32 scale amax / 448, then k_pe's 64 bf16. The fp8 rows are lifted back to bf16
+// sequence after sequence before the sparse attention (glm_kv_dequant), as SGLang does for a prefix.
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <stdint.h>
@@ -33,6 +36,7 @@ typedef unsigned char u8;
 #define TOPK 2048
 #define PAGE 64
 #define IDX_PAGE (PAGE * (ID + 4))
+#define KV8 (KVL + 16 + 2 * 64)
 #define EPS 1e-5f
 
 __device__ __forceinline__ float bf(bf16 x) { return __bfloat162float(x); }
@@ -191,15 +195,16 @@ extern "C" __global__ void glm_silu_mul_quant(const bf16* __restrict__ gu, int I
 
 // The projection [q_a 2048 | kv_a 512 | k_pe 64 | wk 128] of a row (bf16, lda apart):
 //   q_c = bf16(rms(q_a) * g_q), quantized per 128 into qq / qsf (q_b's input);
-//   kv[slot] = bf16(rms(kv_a) * g_kv) | rope(k_pe);
+//   kv[slot] = bf16(rms(kv_a) * g_kv) | rope(k_pe), as a bf16 or an fp8 row (glm_mla_prep_fp8);
 //   idx (full layers, else null): k = rope(layernorm(wk)), e4m3 with one f32 scale.
 // rope [pos][64]: 32 cos then 32 sin, interleaved pairs (GLM's rope_interleave).
 //   grid (T), block 256
-extern "C" __global__ void __launch_bounds__(256) glm_mla_prep(
+template <bool FP8>
+__device__ __forceinline__ void mla_prep(
     const bf16* __restrict__ x, int lda, const bf16* __restrict__ g_q, const bf16* __restrict__ g_kv,
     const bf16* __restrict__ rope, const int* __restrict__ pos, const long long* __restrict__ slot,
-    bf16* __restrict__ kv, u8* __restrict__ idx, const bf16* __restrict__ ik_w, const bf16* __restrict__ ik_b,
-    u8* __restrict__ qq, u8* __restrict__ qsf, int sf_rows, int T) {
+    u8* __restrict__ kv, u8* __restrict__ idx, const bf16* __restrict__ ik_w, const bf16* __restrict__ ik_b,
+    u8* __restrict__ qq, u8* __restrict__ qsf, int sf_rows) {
   __shared__ float sm[8];
   const int r = blockIdx.x, t = threadIdx.x, w = t >> 5, l = t & 31;
   const bf16* row = x + (size_t)r * lda;
@@ -227,14 +232,28 @@ extern "C" __global__ void __launch_bounds__(256) glm_mla_prep(
   if (s < 0) return;
   const int p = pos[r];
   const bf16* cs = rope + (size_t)p * 2 * HALF;
-  bf16* dst = kv + s * MLA;
-  dst[2 * t] = __float2bfloat16(kv2[0] * rk * bf(g_kv[2 * t]));
-  dst[2 * t + 1] = __float2bfloat16(kv2[1] * rk * bf(g_kv[2 * t + 1]));
+  const float k0 = rnd(kv2[0] * rk * bf(g_kv[2 * t])), k1 = rnd(kv2[1] * rk * bf(g_kv[2 * t + 1]));
+  u8* dst = kv + s * (FP8 ? KV8 : MLA * 2);
+  bf16* pe = reinterpret_cast<bf16*>(dst + (FP8 ? KVL + 16 : KVL * 2));
+  if constexpr (FP8) {
+    __shared__ float tmax[8];
+    const float m = warp_max(fmaxf(fabsf(k0), fabsf(k1)));
+    if (l == 0) tmax[w] = m;
+    __syncthreads();
+    const int tile = t >> 6;
+    const float sc = fmaxf(tmax[2 * tile], tmax[2 * tile + 1]) / 448.f, inv = sc > 0.f ? 1.f / sc : 0.f;
+    *reinterpret_cast<__nv_fp8x2_storage_t*>(dst + 2 * t) =
+        __nv_cvt_float2_to_fp8x2(make_float2(k0 * inv, k1 * inv), __NV_SATFINITE, __NV_E4M3);
+    if ((t & 63) == 0) reinterpret_cast<float*>(dst + KVL)[tile] = sc;
+  } else {
+    reinterpret_cast<bf16*>(dst)[2 * t] = __float2bfloat16(k0);
+    reinterpret_cast<bf16*>(dst)[2 * t + 1] = __float2bfloat16(k1);
+  }
   if (t < HALF) {
     const float x1 = bf(row[QL + KVL + 2 * t]), x2 = bf(row[QL + KVL + 2 * t + 1]);
     const float c = bf(cs[t]), sn = bf(cs[HALF + t]);
-    dst[KVL + 2 * t] = __float2bfloat16(x1 * c - x2 * sn);
-    dst[KVL + 2 * t + 1] = __float2bfloat16(x2 * c + x1 * sn);
+    pe[2 * t] = __float2bfloat16(x1 * c - x2 * sn);
+    pe[2 * t + 1] = __float2bfloat16(x2 * c + x1 * sn);
   }
   if (idx == nullptr || w != 7) return;
   float k[4], kw[4], kb[4];
@@ -265,6 +284,18 @@ extern "C" __global__ void __launch_bounds__(256) glm_mla_prep(
   const int i = (int)(s % PAGE);
   *reinterpret_cast<unsigned*>(page + i * ID + l * 4) = fp8x4(n[0] / sc, n[1] / sc, n[2] / sc, n[3] / sc);
   if (l == 0) reinterpret_cast<float*>(page + PAGE * ID)[i] = sc;
+}
+
+#define MLA_PREP_ARGS                                                                                    \
+  const bf16 *__restrict__ x, int lda, const bf16 *__restrict__ g_q, const bf16 *__restrict__ g_kv,             \
+      const bf16 *__restrict__ rope, const int *__restrict__ pos, const long long *__restrict__ slot,            \
+      u8 *__restrict__ kv, u8 *__restrict__ idx, const bf16 *__restrict__ ik_w, const bf16 *__restrict__ ik_b,   \
+      u8 *__restrict__ qq, u8 *__restrict__ qsf, int sf_rows, int T
+extern "C" __global__ void __launch_bounds__(256) glm_mla_prep(MLA_PREP_ARGS) {
+  mla_prep<false>(x, lda, g_q, g_kv, rope, pos, slot, kv, idx, ik_w, ik_b, qq, qsf, sf_rows);
+}
+extern "C" __global__ void __launch_bounds__(256) glm_mla_prep_fp8(MLA_PREP_ARGS) {
+  mla_prep<true>(x, lda, g_q, g_kv, rope, pos, slot, kv, idx, ik_w, ik_b, qq, qsf, sf_rows);
 }
 
 // After q_b: the rope of q_pe into the tail of the absorbed query qmla [T, 64, 576], and on full
@@ -342,6 +373,58 @@ extern "C" __global__ void glm_idx_gather(const u8* __restrict__ idx, const int*
   uint4* dv = reinterpret_cast<uint4*>(kg + d * ID);
   for (int i = threadIdx.x; i < n * (ID / 16); i += blockDim.x) dv[i] = sv[i];
   if (threadIdx.x < n) ksf[d + threadIdx.x] = reinterpret_cast<const float*>(src + PAGE * ID)[threadIdx.x];
+}
+
+// The fp8 latent rows of every sequence lifted to bf16 back to back, the same stream as glm_idx_gather's:
+// page j of sequence s lands at rows goff(s) + 64 j of kvd [., 576], each value bf16(e4m3 * its tile's
+// scale) as SGLang's dequantize_k_cache_paged. A block a page, a warp a row; blocks past the last page return.
+//   grid (ceil(ctx / 64) + seqs), block 256
+extern "C" __global__ void glm_kv_dequant(const u8* __restrict__ kv, const int* __restrict__ block_table,
+                                          int max_pages, const int* __restrict__ seq_lens, int nseq,
+                                          bf16* __restrict__ kvd) {
+  int b = blockIdx.x, s = 0;
+  unsigned goff = 0;
+  for (; s < nseq; ++s) {
+    const int pages = (seq_lens[s] + PAGE - 1) / PAGE;
+    if (b < pages) break;
+    b -= pages;
+    goff += seq_lens[s];
+  }
+  if (s == nseq) return;
+  const int n = min(PAGE, seq_lens[s] - b * PAGE), w = threadIdx.x >> 5, l = threadIdx.x & 31;
+  const u8* page = kv + (size_t)block_table[(size_t)s * max_pages + b] * PAGE * KV8;
+  for (int i = w; i < n; i += 8) {
+    const u8* src = page + (size_t)i * KV8;
+    u8* dst = reinterpret_cast<u8*>(kvd + (goff + (size_t)b * PAGE + i) * MLA);
+    const uint4 q = *reinterpret_cast<const uint4*>(src + l * 16);
+    const float sc = reinterpret_cast<const float*>(src + KVL)[l >> 3];
+    const __nv_fp8x2_storage_t* q2 = reinterpret_cast<const __nv_fp8x2_storage_t*>(&q);
+    __nv_bfloat162 o[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      __nv_fp8x2_e4m3 v;
+      v.__x = q2[j];
+      const float2 f = float2(v);
+      o[j] = __floats2bfloat162_rn(f.x * sc, f.y * sc);
+    }
+    reinterpret_cast<uint4*>(dst + l * 32)[0] = reinterpret_cast<const uint4*>(o)[0];
+    reinterpret_cast<uint4*>(dst + l * 32)[1] = reinterpret_cast<const uint4*>(o)[1];
+    if (l < 8) reinterpret_cast<uint4*>(dst + KVL * 2)[l] = reinterpret_cast<const uint4*>(src + KVL + 16)[l];
+  }
+}
+
+// The top-k's sequence-relative key indices (-1 past a short row's keys) as rows of glm_kv_dequant's
+// stream, in place, and the row's live count min(klen, 2048) for the attention.
+//   grid (T), block 256
+extern "C" __global__ void glm_topk_stream(int* __restrict__ ind, const unsigned* __restrict__ ks,
+                                           const int* __restrict__ klen, int* __restrict__ tlen, int T) {
+  const int r = blockIdx.x;
+  int* row = ind + (size_t)r * TOPK;
+  for (int i = threadIdx.x; i < TOPK; i += blockDim.x) {
+    const int k = row[i];
+    row[i] = k < 0 ? -1 : (int)ks[r] + k;
+  }
+  if (threadIdx.x == 0) tlen[r] = min(klen[r], TOPK);
 }
 
 // The top-k's sequence-relative key indices (-1 past a short row's keys) as cache slots through the

@@ -12,11 +12,14 @@ those labels moves only the residual stream (`h`, `res`).
 A layer, as vLLM runs GLM-5 (DeepSeek V3.2's sparse attention) on Blackwell with DeepGEMM:
   - fused_add_rms_norm, the row quantized to e4m3 with UE8M0 scales per 128 columns;
   - [q_a | kv_a | k_pe | wk] in one fp8 GEMM; q_a / kv_a norms, k_pe rope into the latent cache
-    (bf16, kv_norm | k_pe), the indexer key (LayerNorm, rope, e4m3) into its page-blocked cache;
+    (kv_norm | k_pe), the indexer key (LayerNorm, rope, e4m3) into its page-blocked cache;
   - [q_b | wq_b] in one fp8 GEMM, W_UK absorbed per head (bf16 batched GEMM), q_pe rope;
   - on an indexer layer (`full`), the indexer's fp8 MQA logits over every key of the row's
     sequence and the top 2048 of them; a `shared` layer reuses the last indexer layer's picks;
-  - FlashMLA's sparse prefill over the picked latent rows, W_UV per head, o_proj (fp8);
+  - FlashMLA's sparse prefill over the picked latent rows, W_UV per head, o_proj (fp8). With --kv fp8
+    (the default) the latent cache is SGLang's fp8 DSA row (656 bytes: 512 e4m3 in tiles of 128 with
+    f32 scales, 64 bf16 rope), lifted to bf16 sequence after sequence before the attention as SGLang
+    does for a prefix (dequantize_k_cache_paged); --kv bf16 keeps [576] bf16 rows and attends in place;
   - the dense MLP (layers 0-2) or the MoE: sigmoid router with the score bias, top-8 of 256
     renormalized and scaled by 2.5, FlashInfer's routing tables, DeepGEMM's grouped fp8 GEMMs over
     each expert's rows only, the shared expert, one f32 sum.
@@ -44,6 +47,7 @@ once_mod.KERNELS["fill_bf16"] = ("k3_weight_prep", "kern_fill_bf16", ["out buffe
 H, V = 6144, 154880
 QL, KVL, ROPE, NOPE, VD, HEADS = 2048, 512, 64, 192, 256, 64
 MLA = KVL + ROPE                       # 576, a latent cache row
+KV_ROW = {"fp8": KVL + 16 + ROPE * 2, "bf16": MLA * 2}
 IH, ID = 32, 128                       # indexer heads x dim
 QB = HEADS * (NOPE + ROPE)             # 16384
 IQB = IH * ID                          # 4096
@@ -73,12 +77,13 @@ def mla_entry():
     return entry
 
 
-def build(layers, chunk, pack, max_ctx, sub, cuts):
+def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8"):
     assert chunk % sub == 0 and chunk % 128 == 0 and max_ctx % 256 == 0
     max_pages = max_ctx // PAGE
     mcap = TOPK * chunk + EXPERTS * 128          # routed rows, each expert's padded to 128
     ctas = mcap // 128
     kv0 = "kv.0"
+    fp8kv = kv_dtype == "fp8"
 
     ops = {
         "embed": G.plain("embedding", "kern_embedding_i64_bf16",
@@ -118,11 +123,17 @@ def build(layers, chunk, pack, max_ctx, sub, cuts):
         "topk_slots": G.plain("glm_glue", "glm_topk_slots",
                               ["inout buffer<i32>", "in buffer<i32>", "i32", "in buffer<i32>", "in buffer<i32>",
                                "out buffer<i32>", "i32"], [T, 1, 1], [256, 1, 1]),
+        "topk_stream": G.plain("glm_glue", "glm_topk_stream",
+                               ["inout buffer<i32>", "in buffer<u32>", "in buffer<i32>", "out buffer<i32>", "i32"],
+                               [T, 1, 1], [256, 1, 1]),
+        "kv_dequant": G.plain("glm_glue", "glm_kv_dequant",
+                              ["in state", "in buffer<i32>", "i32", "in buffer<i32>", "i32", "out buffer<bf16>"],
+                              [{"add": [{"ceil_div": [CTX, PAGE]}, S]}, 1, 1], [256, 1, 1]),
         "uk": G.bf16_batched(KVL, NOPE, chunk, (NB[True] * 2, (NOPE + ROPE) * 2), (NOPE * 2, KVL * NOPE * 2),
                              (HEADS * MLA * 2, MLA * 2)),
         "uv": G.bf16_batched(VD, KVL, chunk, (HEADS * KVL * 2, KVL * 2), (KVL * 2, (NOPE + VD) * KVL * 2),
                              (HEADS * VD * 2, VD * 2)),
-        "flash_mla": G.flash_mla(chunk, mla_entry()),
+        "flash_mla": G.flash_mla(chunk, mla_entry(), "in buffer<bf16>" if fp8kv else "in state"),
         "router_topk": {"params": ["in buffer<f32>", "in buffer<f32>", "in buffer<bf16>", "out buffer<i32>",
                                    "out buffer<f32>", "i32"],
                         "impl": {"launches": [{**module("k3_router_argmax", EXPERTS=EXPERTS, TOPK=TOPK),
@@ -157,8 +168,9 @@ def build(layers, chunk, pack, max_ctx, sub, cuts):
     prep_params = ["in buffer<bf16>", "i32", "in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "in buffer<i32>",
                    "in buffer<i64>", "inout state", "inout state", "in buffer<bf16>", "in buffer<bf16>", "out buffer<u8>",
                    "out buffer<u8>", "i32", "i32"]
-    ops["mla_prep_full"] = G.plain("glm_glue", "glm_mla_prep", prep_params, [T, 1, 1], [256, 1, 1])
-    ops["mla_prep_shared"] = G.nulled("glm_glue", "glm_mla_prep", prep_params, {8, 9, 10}, [T, 1, 1], [256, 1, 1])
+    prep = "glm_mla_prep_fp8" if fp8kv else "glm_mla_prep"
+    ops["mla_prep_full"] = G.plain("glm_glue", prep, prep_params, [T, 1, 1], [256, 1, 1])
+    ops["mla_prep_shared"] = G.nulled("glm_glue", prep, prep_params, {8, 9, 10}, [T, 1, 1], [256, 1, 1])
     for j in range(chunk // sub):
         ops[f"indexer.{j}"] = G.indexer(j, sub, max_ctx)
 
@@ -259,6 +271,8 @@ def build(layers, chunk, pack, max_ctx, sub, cuts):
     work("ksf", [max_ctx], "f32")
     work("logits", [sub * max_ctx], "f32")
     work("ind", [T, G.TOPK], "i32")
+    if fp8kv:
+        work("kvd", [max_ctx, MLA])
     work("ml", [T, HEADS], "f32")
     work("lse", [T, HEADS], "f32")
     work("rl", [T, EXPERTS], "f32")
@@ -307,7 +321,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts):
         mlp = f"{HF}layers.{l}.mlp."
         if l in cuts:
             plan(l)
-        states[f"kv.{l}"] = {"bytes_per_token": MLA * 2}
+        states[f"kv.{l}"] = {"bytes_per_token": KV_ROW[kv_dtype]}
         if full:
             states[f"idx.{l}"] = {"bytes_per_token": IDX_ROW}
         weight(n + "gamma_in", [H], [seg(f"{HF}layers.{l}.input_layernorm.weight")])
@@ -365,13 +379,19 @@ def build(layers, chunk, pack, max_ctx, sub, cuts):
                      buf("wout", r0 * IH * 4), buf("ks", r0 * 4), buf("ke", r0 * 4), buf("zero", r0 * 4),
                      buf("klen", r0 * 4), buf("logits"), buf("ind", r0 * G.TOPK * 4),
                      expr({"clamp": [T, r0, sub]}), var(CTX), expr({"mul": [{"ceil_div": [CTX, 256]}, 256]}))
-            step(n + "topk_slots", "topk_slots", buf("ind"), buf("block_table"), i32(max_pages), buf("row_seq"),
-                 buf("klen"), buf("tlen"), var(T))
+            if fp8kv:
+                step(n + "topk_stream", "topk_stream", buf("ind"), buf("ks"), buf("klen"), buf("tlen"), var(T))
+            else:
+                step(n + "topk_slots", "topk_slots", buf("ind"), buf("block_table"), i32(max_pages), buf("row_seq"),
+                     buf("klen"), buf("tlen"), var(T))
         else:
             step(n + "q_post", "q_post_shared", buf("qb"), i32(NB[True]), buf("rope"), buf("pos"), buf("qmla"),
                  i32(0), var(T))
-        step(n + "attn", "flash_mla", buf("qmla"), buf("qmla", KVL * 2), kv, buf("ind"), buf("tlen"), buf("o"),
-             buf("ml"), buf("lse"))
+        if fp8kv:
+            step(n + "kv_dequant", "kv_dequant", kv, buf("block_table"), i32(max_pages), buf("seq_lens"), var(S),
+                 buf("kvd"))
+        step(n + "attn", "flash_mla", buf("qmla"), buf("qmla", KVL * 2), buf("kvd") if fp8kv else kv, buf("ind"),
+             buf("tlen"), buf("o"), buf("ml"), buf("lse"))
         step(n + "uv", "uv", buf("o"), buf(n + "kvb", NOPE * KVL * 2), buf("ov"), var(T))
         step(n + "quant_o", "quant_o", buf("ov"), i32(HEADS * VD), buf("oq"), buf("osf"), i32(chunk), i32(HEADS * VD),
              var(T))
@@ -455,10 +475,11 @@ def main():
     ap.add_argument("--max-ctx", type=int, default=1 << 20, help="the call's sequences' lengths summed, at most")
     ap.add_argument("--sub", type=int, default=1024, help="rows a call's indexer scores at once (logits sub x max-ctx f32)")
     ap.add_argument("--cuts", default="18,38,58", help="layers a stage starts at, each an indexer layer")
+    ap.add_argument("--kv", choices=("fp8", "bf16"), default="fp8", help="the latent cache's rows")
     a = ap.parse_args()
     cuts = {int(c) for c in a.cuts.split(",") if c}
     assert cuts <= FULL, "a stage starts at an indexer layer: the picks never cross a cut"
-    json.dump(build(a.layers, a.chunk, a.pack, a.max_ctx, a.sub, cuts), sys.stdout, indent=1)
+    json.dump(build(a.layers, a.chunk, a.pack, a.max_ctx, a.sub, cuts, a.kv), sys.stdout, indent=1)
     print()
 
 

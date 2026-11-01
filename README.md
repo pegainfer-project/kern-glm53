@@ -21,9 +21,14 @@ checkpoint (GLM-5.2-FP8 has the same tensors).
   of two) block scales, DeepGEMM's packed layout, the way vLLM's `requant_weight_ue8m0` prepares a
   128x128-block checkpoint for DeepGEMM on Blackwell; activations are quantized per 128 columns with
   UE8M0 scales as vLLM's `per_token_group_quant_fp8(..., use_ue8m0=True)` does.
-- **Latent cache in bf16** (576 values a token: kv_norm | roped k_pe). vLLM stores GLM-5's MLA cache
-  as `fp8_ds_mla` (656 bytes a token); FlashMLA's bf16 sparse prefill reads this one directly. The
-  indexer cache is vLLM's: e4m3 keys with one f32 scale, page-blocked (132 bytes a token).
+- **Latent cache in fp8** (`--kv fp8`, the default): SGLang's and vLLM's DSA row (`fp8_ds_mla`, 656
+  bytes a token): kv_norm as 512 e4m3 in four tiles of 128, each with its f32 scale amax / 448, then
+  the roped k_pe in 64 bf16. Before each layer's attention the call's sequences are lifted back to
+  bf16 rows end to end (SGLang's `dequantize_k_cache_paged` for a prefix), the top-k turned into rows
+  of that stream, and FlashMLA's bf16 sparse prefill reads them. Every call reads its own rows back
+  through the fp8 cache, the fresh chunk included. `--kv bf16` keeps 576 bf16 values a token, which
+  the attention reads in place. The indexer cache is vLLM's: e4m3 keys with one f32 scale,
+  page-blocked (132 bytes a token).
 - **Sparse attention at every length.** A row attends the top 2048 keys its indexer picked, and every
   key when its sequence has at most 2048, which is dense attention through the sparse kernel.
 - **MoE.** FlashInfer's routing tables over the router's top-8, then DeepGEMM's m-grouped fp8 GEMM in

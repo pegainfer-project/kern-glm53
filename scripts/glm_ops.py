@@ -135,9 +135,10 @@ def indexer(j, r, kv_cap):
 SCALE = 256 ** -0.5  # qk_nope 192 + rope 64
 
 
-def flash_mla(rows, entry):
-    """`entry` is read off the cubin: its mangled TmaParams type runs to 1.5 KB. Interface: q [., 64, 576], q again (its rope view, offset 1024 bytes), kv state [slot][576],
-    ind [., 2048] slots (-1 masked), tlen [.], o [., 64, 512] out, max_logits, lse [., 64] f32 out."""
+def flash_mla(rows, entry, kv):
+    """`entry` is read off the cubin: its mangled TmaParams type runs to 1.5 KB. Interface: q [., 64, 576], q again
+    (its rope view, offset 1024 bytes), kv [row][576] bf16 (`kv` its param type: the cache state, or the lifted
+    stream), ind [., 2048] rows of kv (-1 masked), tlen [.], o [., 64, 512] out, max_logits, lse [., 64] f32 out."""
     i32 = lambda at, v: {"at": at, "i32": v}
     f32 = lambda at, v: {"at": at, "f32": v}
     ptr = lambda at, p: {"at": at, "param": p}
@@ -155,7 +156,7 @@ def flash_mla(rows, entry):
         i32(0x300, 64), i32(0x304, 512), s_q(0x308),
         tm(0x380, 5, "bf16", [512, 64, rows], [1024, 64 * 1024], [64, 64, 1], 128, 128),
         tm(0x480, 2, "bf16", [512, 0], [1152], [64, 1], 128, 256)]}}
-    return {"params": ["in buffer<bf16>", "in buffer<bf16>", "in state", "in buffer<i32>", "in buffer<i32>",
+    return {"params": ["in buffer<bf16>", "in buffer<bf16>", kv, "in buffer<i32>", "in buffer<i32>",
                        "out buffer<bf16>", "out buffer<f32>", "out buffer<f32>"],
             "impl": {"launches": [launch("glm_flashmla", entry, [T, 1, 1], [384, 1, 1], 230704,
                                          params=["bytes<144>", "bytes<1280>"], args=[params, tma])]}}
