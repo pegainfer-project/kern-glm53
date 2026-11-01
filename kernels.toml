@@ -1,0 +1,75 @@
+# Every module the GLM-5.3 manifests launch that kern's kernel index does not hold.
+# `scripts/build.py` compiles each from `source` with the named `flags` and `includes`
+# (or copies `prebuilt`), writes `build/<name>.cubin` and checks it against `sha256`.
+
+[toolchain]
+nvcc = "13.1.115"
+arch = "sm_103a"
+
+# Git submodules under third_party/ (their CUTLASS submodules at `cutlass`), MIT-licensed by DeepSeek.
+[upstreams.DeepGEMM]
+url = "https://github.com/deepseek-ai/DeepGEMM"
+commit = "ab69f76be5bb9ea3499bc755002b1a876cb0b3d9"
+cutlass = "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8"
+
+[upstreams.FlashMLA]
+url = "https://github.com/deepseek-ai/FlashMLA"
+commit = "4f38f29ef6793c228363e4af5be66d44e81167ba"
+cutlass = "147f5673d0c1c3dcf66f78d677fd647e4a020219"
+
+[flags]
+plain = ["-std=c++17", "-O3"]
+deepgemm = ["-std=c++20", "-O3", "--expt-relaxed-constexpr", "-DDG_NO_TORCH", "-diag-suppress", "20012,177"]
+flashmla = ["-std=c++20", "-O3", "--expt-relaxed-constexpr", "--expt-extended-lambda", "-DNDEBUG",
+            "-diag-suppress", "20012,177,445"]
+
+[includes]
+deepgemm = ["third_party/DeepGEMM/deep_gemm/include", "third_party/DeepGEMM/third-party/cutlass/include"]
+flashmla = ["third_party/FlashMLA/csrc", "third_party/FlashMLA/csrc/kerutils/include",
+            "third_party/FlashMLA/csrc/cutlass/include"]
+
+# DeepGEMM sm100: the fp8 GEMMs (dense and the MoE's psum-grouped), the bf16 batched absorb / v-up,
+# the indexer's fp8 MQA logits. Unmodified upstream templates.
+[kernels."glm_deepgemm"]
+sha256 = "0847c7d5018b5c0e01e5849e56c66405847f5756e1e8924cd049be2f96b06f8e"
+source = "source/glm_deepgemm.cu"
+flags = "deepgemm"
+includes = ["deepgemm"]
+
+# FlashMLA sm100 sparse prefill, head 64, d_qk 576. Unmodified upstream instantiation.
+[kernels."glm_flashmla"]
+sha256 = "14417771a0ab8a63895a78f73a3962f4394b92bd5735e148791affa1f6d9f9c0"
+source = "source/glm_flashmla.cu"
+flags = "flashmla"
+includes = ["flashmla"]
+
+# vLLM's prefill top-k (source/vllm-topk/PROVENANCE.md).
+[kernels."vllm_topk"]
+sha256 = "2052d0cadf13ebcb1cef5c678a069f128a1e21ecc4696c2349909ff3e543a80a"
+source = "source/vllm-topk/topk.cu"
+
+[kernels."glm_glue"]
+sha256 = "c3e2da89fac44223306b0bfaa04d7f5bcd43fdf07fcc368e2bb550f2cf820aa9"
+source = "source/glm_glue.cu"
+
+[kernels."glm_prep"]
+sha256 = "fb1126a04383333649aaffc21fb65d566842d509d8b056f3f75589d588615966"
+source = "source/glm_prep.cu"
+
+# From kern-k3-pp-prefill 08001b95: the router top-k (sigmoid + bias, renormalized, routed scaling)
+# and the vocab argmax, rebuilt for 256 experts and top-8 (source/k3/README.md); the packed
+# call's last rows.
+[kernels."k3_router_argmax+EXPERTS=256+TOPK=8"]
+sha256 = "ca7a170cf599575c79b6f1269c0b7da5d79014d8e2a3ce2b4a4fb865b4e229ab"
+source = "source/k3/k3_router_argmax.cu"
+defines = { EXPERTS = 256, TOPK = 8 }
+
+[kernels."copy_rows"]
+sha256 = "448042b7f709b3a6b31ad8fcffcf7871b7e02ab0c12e5ced9fbee57ed03e4523"
+source = "source/k3/copy_rows.cu"
+
+# kern-k3-pp-prefill's bundled FlashInfer routing over precomputed top-k
+# (KernelParams<float, 1024, 16>), byte for byte; its recipe and provenance live there.
+[kernels."flashinfer_moe_routing"]
+prebuilt = "prebuilt/flashinfer_moe_routing.cubin"
+sha256 = "d797b1d2edad680ecc0578d4d8a57d5f1a6a364bbb3acd7ecd4d6270c6be4ae0"
