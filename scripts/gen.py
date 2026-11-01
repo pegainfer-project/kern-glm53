@@ -77,12 +77,13 @@ def mla_entry():
     return entry
 
 
-def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8"):
+def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0):
     assert chunk % sub == 0 and chunk % 128 == 0 and max_ctx % 256 == 0
     max_pages = max_ctx // PAGE
     mcap = TOPK * chunk + EXPERTS * 128          # routed rows, each expert's padded to 128
     ctas = mcap // 128
-    kv0 = "kv.0"
+    kv0 = f"kv.{first}"
+    head = first == 0 or layers == LAYERS
     fp8kv = kv_dtype == "fp8"
 
     ops = {
@@ -212,9 +213,10 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8"):
         "seq_lens": {"dtype": "i32", "shape": [S], "kind": "input", "fill": "seq_len", "domain": {"min": 1}},
         "cu_seqlens": {"dtype": "i64", "shape": [pack + 1], "kind": "input", "fill": "cu_seqlens",
                        "domain": {"min": 0, "max": chunk, "monotone": True}},
-        "next_token": {"dtype": "i64", "shape": [S], "kind": "output", "fill": "tokens",
-                       "domain": {"index_into": "embed"}},
     }
+    if head:
+        buffers["next_token"] = {"dtype": "i64", "shape": [S], "kind": "output", "fill": "tokens",
+                                 "domain": {"index_into": "embed"}}
     states = {}
     programs = {}
     once = Once({"buffers": buffers, "ops": ops, "programs": programs})
@@ -247,8 +249,9 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8"):
                                       i64(sf_group)]})
 
     weight("embed", [V, H], [seg(HF + "embed_tokens.weight")])
-    weight("gamma_final", [H], [seg(HF + "norm.weight")])
-    weight("w_lm", [V, H], [seg("lm_head.weight")])
+    if head:
+        weight("gamma_final", [H], [seg(HF + "norm.weight")])
+        weight("w_lm", [V, H], [seg("lm_head.weight")])
     carry("rope", [max_ctx, ROPE])
     once.rope(("rope", 0), ("rope", ROPE), max_ctx, ROPE // 2, ROPE, 8e6)
     carry("rs", [1])
@@ -312,14 +315,14 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8"):
         step(f"L{l}.plan", "plan", buf("cu_seqlens"), buf("seq_lens"), var(S), buf("pos"), buf("ks"), buf("ke"),
              buf("klen"), buf("row_seq"), buf("zero"), var(T))
 
-    plan(0)
+    plan(first)
     step("embed", "embed", buf("token_ids"), buf("embed"), buf("res"), var(T), i32(H))
-    for l in range(layers):
+    for l in range(first, layers):
         full = l in FULL
         n = f"L{l}."
         a = f"{HF}layers.{l}.self_attn."
         mlp = f"{HF}layers.{l}.mlp."
-        if l in cuts:
+        if l in cuts and l != first:
             plan(l)
         states[f"kv.{l}"] = {"bytes_per_token": KV_ROW[kv_dtype]}
         if full:
@@ -350,7 +353,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8"):
             weight(n + "w_p", [IH, H], [seg(a + "indexer.weights_proj.weight")])
 
         # attention
-        if l == 0:
+        if l == first:
             step(n + "norm_in", "rms_quant", buf("res"), buf(n + "gamma_in"), buf("xn"), buf("xq"), buf("xsf"),
                  i32(chunk), var(T))
         else:
@@ -441,12 +444,13 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8"):
         gemm(n + "sdn", "shared.dn", "sq", n + "w_sdn", "sh", a_sf="ssf")
         step(n + "combine", "moe_combine", buf("f2"), buf("exp2perm"), buf("wts"), buf("sh"), buf("h"), var(T))
 
-    step("head.h", "last_rows", buf("hl"), buf("h"), buf("cu_seqlens"), i32(H), i32(H))
-    step("head.res", "last_rows", buf("rlast"), buf("res"), buf("cu_seqlens"), i32(H), i32(H))
-    step("head.norm", "head_norm", buf("hl"), buf("rlast"), buf("gamma_final"), buf("xf"), i32(0), var(S))
-    step("head.lm", "gemm_f32", buf("xf"), buf("w_lm"), buf("lg"), var(S), i32(V), i32(H), i32(V))
-    step("head.argmax", "argmax_partial", buf("lg"), buf("pmax"), buf("pidx"), i32(V))
-    step("head.token", "argmax_final", buf("pmax"), buf("pidx"), buf("next_token"), i32(64))
+    if head:
+        step("head.h", "last_rows", buf("hl"), buf("h"), buf("cu_seqlens"), i32(H), i32(H))
+        step("head.res", "last_rows", buf("rlast"), buf("res"), buf("cu_seqlens"), i32(H), i32(H))
+        step("head.norm", "head_norm", buf("hl"), buf("rlast"), buf("gamma_final"), buf("xf"), i32(0), var(S))
+        step("head.lm", "gemm_f32", buf("xf"), buf("w_lm"), buf("lg"), var(S), i32(V), i32(H), i32(V))
+        step("head.argmax", "argmax_partial", buf("lg"), buf("pmax"), buf("pidx"), i32(V))
+        step("head.token", "argmax_final", buf("pmax"), buf("pidx"), buf("next_token"), i32(64))
 
     programs["prefill"] = kern_manifest.program(prog, groups=pack, rows=T, context=CTX)
     m = {
@@ -476,10 +480,13 @@ def main():
     ap.add_argument("--sub", type=int, default=1024, help="rows a call's indexer scores at once (logits sub x max-ctx f32)")
     ap.add_argument("--cuts", default="18,38,58", help="layers a stage starts at, each an indexer layer")
     ap.add_argument("--kv", choices=("fp8", "bf16"), default="fp8", help="the latent cache's rows")
+    ap.add_argument("--first", type=int, default=0,
+                    help="first layer, fed the token embedding (a stage's stand-in for kern bench, which feeds a cut "
+                         "stage's crossing h / res as it finds them)")
     a = ap.parse_args()
     cuts = {int(c) for c in a.cuts.split(",") if c}
     assert cuts <= FULL, "a stage starts at an indexer layer: the picks never cross a cut"
-    json.dump(build(a.layers, a.chunk, a.pack, a.max_ctx, a.sub, cuts, a.kv), sys.stdout, indent=1)
+    json.dump(build(a.layers, a.chunk, a.pack, a.max_ctx, a.sub, cuts, a.kv, a.first), sys.stdout, indent=1)
     print()
 
 
