@@ -66,8 +66,8 @@ def call(stages, seqs):
     ids = torch.tensor([t for i, lo, hi, _ in seqs for t in i[lo:hi]], dtype=torch.int64)
     pos = [torch.arange(lo, hi, dtype=torch.int64) for _, lo, hi, _ in seqs]
     slots = torch.cat([(p // PAGE + p0) * PAGE + p % PAGE for p, (_, _, _, p0) in zip(pos, seqs)])
-    cu = torch.zeros(17, dtype=torch.int64)
-    cu[1:] = torch.tensor([hi - lo for _, lo, hi, _ in seqs]).cumsum(0).tolist()[-1]
+    cu = torch.full((stages[0].m["buffers"]["cu_seqlens"]["shape"][0],), n, dtype=torch.int64)
+    cu[0] = 0
     cu[1 : len(seqs) + 1] = torch.tensor([hi - lo for _, lo, hi, _ in seqs]).cumsum(0)
     lens = torch.tensor([hi for _, _, hi, _ in seqs], dtype=torch.int32)
     for k, s in enumerate(stages):
@@ -75,8 +75,7 @@ def call(stages, seqs):
         if s.has("token_ids"):
             s.view("token_ids")[:n].copy_(ids)
         s.view("slot_mapping")[:n].copy_(slots)
-        bt = s.view("block_table")
-        bt = bt.view(16, bt.numel() // 16)
+        bt = s.view("block_table").view(-1, s.m["buffers"]["block_table"]["shape"][1])
         for j, (_, _, hi, p0) in enumerate(seqs):
             np_ = -(-hi // PAGE)
             bt[j, :np_].copy_(torch.arange(p0, p0 + np_, dtype=torch.int32))
