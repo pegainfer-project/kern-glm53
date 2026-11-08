@@ -12,6 +12,9 @@
 // glm_kvb: kv_b_proj dequantized to bf16 [64 * 448, 512] (W_UV is a view of it), and W_UK
 // transposed per head into [64, 512, 192] for the q absorption's batched GEMM.
 //   grid (64 * 448 * 512 / 256), block 256
+//
+// glm_fill_bf16: p[i] = v, the router's routed scaling factor.
+//   grid (ceil(n / 256)), block 256
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <stdint.h>
@@ -79,4 +82,9 @@ extern "C" __global__ void glm_kvb(const u8* __restrict__ w, const float* __rest
   kvb[idx] = v;
   const int h = row / 448, r = row % 448;
   if (r < 192) wuk[((size_t)h * 512 + c) * 192 + r] = v;
+}
+
+extern "C" __global__ void glm_fill_bf16(__nv_bfloat16* __restrict__ p, int n, float v) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) p[i] = __float2bfloat16_rn(v);
 }

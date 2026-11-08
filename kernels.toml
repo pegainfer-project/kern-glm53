@@ -53,7 +53,7 @@ sha256 = "03df8286b6fccefd864eb49549e74776efccabb93d09ebc8d80eb72debdcec2c"
 source = "source/glm_glue.cu"
 
 [kernels."glm_prep"]
-sha256 = "fb1126a04383333649aaffc21fb65d566842d509d8b056f3f75589d588615966"
+sha256 = "2d228fb79c3437d28f588fbdd064dda678249dc3fbb4c6a4e873e67447bcb084"
 source = "source/glm_prep.cu"
 
 # From kern-k3-pp-prefill 08001b95: the router top-k (sigmoid + bias, renormalized, routed scaling)

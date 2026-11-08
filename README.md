@@ -42,11 +42,11 @@ checkpoint (GLM-5.2-FP8 has the same tensors).
 | `glm_flashmla` | sparse MLA prefill, 64 heads, d_qk 576 | new upstream: FlashMLA `4f38f29e`, MIT |
 | `vllm_topk` | the indexer's top-2048 per row | new upstream: vLLM `f4edf9f0` `csrc/sampler.cu`, Apache-2.0 (`source/vllm-topk/`) |
 | `glm_glue` | norms, quantization, rope, cache writes, row plan, MoE gather / combine | ours, after vLLM's GLM-5 math |
-| `glm_prep` | load-time UE8M0 re-quantization, kv_b split | ours, after vLLM's `requant_weight_ue8m0` |
+| `glm_prep` | load-time UE8M0 re-quantization, kv_b split, the routed scaling fill | ours, after vLLM's `requant_weight_ue8m0` |
 | `k3_router_argmax+EXPERTS=256+TOPK=8` | router top-8, vocab argmax | rebuilt from K3 with new defines (`source/k3/README.md`) |
 | `copy_rows` | each sequence's last row | reused from K3 |
 | `flashinfer_moe_routing` | MoE routing tables | reused from K3 (prebuilt, Apache-2.0, `prebuilt/LICENSE.flashinfer`) |
-| `embedding`, `weight_prep`, `k3_weight_prep` | embedding gather, rope table, fills | reused from kern's kernel index |
+| `embedding`, `weight_prep` | embedding gather, rope table, fills | reused from kern's kernel index |
 
 ## Licenses
 
