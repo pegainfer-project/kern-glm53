@@ -33,6 +33,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import types
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 sys.path.insert(1, str(pathlib.Path(os.environ["KERN"]) / "tools"))
@@ -42,7 +43,9 @@ import once as once_mod  # noqa: E402
 from once import Once, buf, seg  # noqa: E402
 from pinned import module  # noqa: E402
 
-once_mod.KERNELS["fill_bf16"] = ("k3_weight_prep", "kern_fill_bf16", ["out buffer<bf16>", "i32", "f32"])
+# `once`'s modules resolve as the step's own do: this repository's pin first (pinned.py), then the index.
+once_mod.variant = lambda family, **defines: types.SimpleNamespace(module=module(family, **defines))
+once_mod.KERNELS["fill_bf16"] = ("glm_prep", "glm_fill_bf16", ["out buffer<bf16>", "i32", "f32"])
 
 H, V = 6144, 154880
 QL, KVL, ROPE, NOPE, VD, HEADS = 2048, 512, 64, 192, 256, 64
