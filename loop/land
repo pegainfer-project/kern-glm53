@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # loop/land SHA "WHAT" [NOTE]: the orchestrator's merge of one agent commit into this checkout's main.
 #
-# Cherry-picks SHA without committing, builds (the pins must hold), generates the sub-model, A/Bs main's base
+# Cherry-picks SHA without committing (a conflict only in kernels.toml takes SHA's side), builds and repins, generates the sub-model, A/Bs main's base
 # against it (loop/ab, two pairs) and runs the numerics gate against main (loop/longcheck). Prints both. Then,
 # only with LAND=1 and the gate passing (all lower, short and long not up beyond 0.3%, longcheck inside
-# TASK.md's floor): appends the HISTORY.md row (main's commit it lands after, scores from the A/B's B side, Δ all against
-# the row above, launches, the gate's long line, NOTE) and commits the pick with SHA's message and author; main's base moves to it
+# TASK.md's floor): appends the HISTORY.md row (main's commit it lands after, the row above times the A/B's B/A ratio per scenario,
+# Δ all the A/B's own, launches, the gate's long line, NOTE) and commits the pick with SHA's message and author; main's base moves to it
 # (manifests, bench report, recordings). Without LAND=1 the pick is left staged for a look; `git reset --hard`
 # drops it.
 set -euo pipefail
@@ -14,10 +14,14 @@ sha=$1 what=$2 note=${3:-}
 base=$GLM_LOOP_DATA/base
 cd "$REPO"
 [[ -z $(git status --porcelain --untracked-files=no) ]] || { echo "land: the tree is not clean" >&2; exit 1; }
-git cherry-pick -n "$sha"
+# kernels.toml's pins were the agent's main's; the build repins them on this main (the bench and the gate judge it)
+git cherry-pick -n "$sha" || {
+  [[ $(git diff --name-only --diff-filter=U) == kernels.toml ]] || { echo "land: conflicts beyond kernels.toml" >&2; exit 1; }
+  git checkout --theirs kernels.toml && git add kernels.toml
+}
 work=$GLM_LOOP_DATA/land/$sha
 mkdir -p "$work"
-"$LOOP_DIR/build" > "$work/build.log" 2>&1 || { tail -3 "$work/build.log"; exit 1; }
+"$LOOP_DIR/build" --update > "$work/build.log" 2>&1 || { tail -3 "$work/build.log"; exit 1; }
 "$LOOP_DIR/gen" "$work" | tee "$work/count.txt"
 "$LOOP_DIR/ab" "$base/l11.json" "$work/l11.json" "$work/ab" 2 | tee "$work/ab.txt"
 "$LOOP_DIR/longcheck" "$work/l11.json" "$work/lc" | tee "$work/lc.txt"
@@ -38,20 +42,9 @@ print("gate: " + ("pass" if not why else "; ".join(why)))
 sys.exit(1 if why else 0)
 PY
 
-scores=$(python3 - "$work/ab" "$LOOP_DIR" <<'PY'
-import importlib.machinery, importlib.util, json, statistics, sys
-out, loop = sys.argv[1], sys.argv[2]
-spec = importlib.util.spec_from_loader("score", importlib.machinery.SourceFileLoader("score", loop + "/score"))
-sc = importlib.util.module_from_spec(spec); spec.loader.exec_module(sc)
-runs = [sc.score(json.load(open(f"{out}/b-{i}.json")))[0] for i in (1, 2)]
-print(" ".join(f"{statistics.median(r[k] for r in runs):.2f}" for k in ("short", "long", "all")))
-PY
-)
-read -r short long all <<<"$scores"
 prev=$(grep -E '^\| [0-9]+ \|' "$LOOP_DIR/HISTORY.md" | tail -n 1)
 n=$(($(cut -d'|' -f2 <<<"$prev") + 1))
-prev_all=$(cut -d'|' -f7 <<<"$prev" | tr -d ' ')
-delta=$(python3 -c "print(f'{100 * ($all / $prev_all - 1):+.2f}%')")
+read -r short long all delta < <(python3 "$LOOP_DIR/chain.py" "$work/ab" "$LOOP_DIR" "$prev")
 launches=$(grep -oE '[0-9]+ launches' "$work/count.txt" | cut -d' ' -f1)
 gate=$(grep -E '^long ' "$work/lc.txt" | sed -E 's/^long +positions [0-9]+ · //; s/ · \|dlp\|.*//')
 author=$(git log -1 --format='%an' "$sha")
