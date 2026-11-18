@@ -22,3 +22,4 @@ is that A/B's. Numerics are `loop/longcheck`'s long pass against the row above.
 | 10 | 434bbdd | indexer head weights bf16, 32-head sum in bf16 | 234.06 | 1080.17 | 267.23 | -0.82% | 545 | top-1 91.117% · flips 23285 (confident 2); 78 layers vs SGLang 95.28% / 10 confident (main 95.20% / 11) |
 | 11 | d333279 | routing tables in two launches: a bitmap tally per 256-token slice, each routed row's place | 233.77 | 1081.14 | 266.99 | -0.09% | 529 | top-1 100.000% · flips 0 (confident 0) |
 | 12 | 6c72463 | norms move 16 bytes a thread, skip the unread bf16 row | 232.27 | 1070.73 | 265.14 | -0.69% | 529 | top-1 100.000% · flips 0 (confident 0) |
+| 13 | 083031f | latent lift on lane 1 beside the query chain; up to 2048 rows the shared expert beside the routed experts | 231.02 | 1070.40 | 263.92 | -0.46% | 553 | top-1 100.000% · flips 0 (confident 0) |
