@@ -20,3 +20,4 @@ is that A/B's. Numerics are `loop/longcheck`'s long pass against the row above.
 | 8 | 25aca61 | v up-projection writes o_proj's e4m3 input, quant_o gone | 236.63 | 1087.03 | 269.97 | -1.38% | 529 | top-1 100.000% · flips 0 (confident 0) |
 | 9 | 1cb05d3 | kv_dequant lifts only the rows some top-k picked, up to 2048 rows | 235.96 | 1090.20 | 269.45 | -0.19% | 545 | top-1 100.000% · flips 0 (confident 0) |
 | 10 | 434bbdd | indexer head weights bf16, 32-head sum in bf16 | 234.06 | 1080.17 | 267.23 | -0.82% | 545 | top-1 91.117% · flips 23285 (confident 2); 78 layers vs SGLang 95.28% / 10 confident (main 95.20% / 11) |
+| 11 | d333279 | routing tables in two launches: a bitmap tally per 256-token slice, each routed row's place | 233.77 | 1081.14 | 266.99 | -0.09% | 529 | top-1 100.000% · flips 0 (confident 0) |

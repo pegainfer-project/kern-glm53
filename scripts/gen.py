@@ -21,7 +21,7 @@ A layer, as vLLM runs GLM-5 (DeepSeek V3.2's sparse attention) on Blackwell with
     f32 scales, 64 bf16 rope), lifted to bf16 sequence after sequence before the attention as SGLang
     does for a prefix (dequantize_k_cache_paged); --kv bf16 keeps [576] bf16 rows and attends in place;
   - the dense MLP (layers 0-2) or the MoE: sigmoid router with the score bias, top-8 of 256
-    renormalized and scaled by 2.5, FlashInfer's routing tables, DeepGEMM's grouped fp8 GEMMs over
+    renormalized and scaled by 2.5, the routing tables (an expert's rows in token order), DeepGEMM's grouped fp8 GEMMs over
     each expert's rows only, the shared expert, one f32 sum.
 Weights are the checkpoint's e4m3 tensors re-quantized to UE8M0 block scales while they load (the
 `derive` program, source/glm_prep.cu), the way vLLM prepares 128x128-block checkpoints for DeepGEMM
@@ -106,7 +106,6 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
     layouts = moe_layouts(moe_tiles, chunk)
     tiles = [bm or 128 for _, bm in layouts]
     mcap = TOPK * chunk + EXPERTS * max(tiles)   # routed rows, each expert's padded to its block M
-    ctas = mcap // min(tiles)
     kv0 = f"kv.{first}"
     head = first == 0 or layers == LAYERS
     fp8kv = kv_dtype == "fp8"
@@ -161,10 +160,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
                         "impl": {"launches": [{**module("k3_router_argmax", EXPERTS=EXPERTS, TOPK=TOPK),
                                                "entry": "kern_k3_router_topk", "grid": [T, 1, 1],
                                                "block": [256, 1, 1]}]}},
-        "routing": G.routing(EXPERTS, TOPK, [(w, bm or 128) for w, bm in layouts]),
-        "moe_psum": {"params": ["in buffer<i32>", "out buffer<i32>"], "impl": {"launches": [
-            G.launch("glm_glue", "glm_moe_psum", [1, 1, 1], [256, 1, 1], params=["in buffer<i32>", "out buffer<i32>", "i32"],
-                     args=[{"param": 0}, {"param": 1}, {"i32": bm or 128}], when=w) for w, bm in layouts]}},
+        "moe_route": G.moe_route(EXPERTS, [(w, bm or 128) for w, bm in layouts]),
         "moe_gather": G.plain("glm_glue", "glm_moe_gather",
                               ["in buffer<u8>", "in buffer<u8>", "i32", "in buffer<i32>", "out buffer<u8>",
                                "out buffer<u8>", "i32"], [T, 1, 1], [384, 1, 1]),
@@ -314,13 +310,8 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
     work("ids", [T, TOPK], "i32")
     work("wts", [T, TOPK], "f32")
     work("exp2perm", [T, TOPK], "i32")
-    work("counts", [G.counts_len(EXPERTS)], "i32")
-    work("cta_batch", [ctas], "i32")
-    work("cta_limit", [ctas], "i32")
-    work("nne", [1], "i32")
-    work("tpad", [1], "i32")
-    work("route_map", [mcap], "i32")
     work("psum", [EXPERTS], "i32")
+    work("hist", [-(-chunk // G.ROUTE_SLICE), EXPERTS], "i32")
     work("mq", [mcap, H], "u8")
     work("msf", [sf_bytes(H, mcap)], "u8")
     work("g13", [mcap, 2 * INTER])
@@ -463,9 +454,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
 
         step(n + "router", "gemm_f32", buf("xn"), buf(n + "w_r"), buf("rl"), var(T), i32(EXPERTS), i32(H), i32(EXPERTS))
         step(n + "topk", "router_topk", buf("rl"), buf(n + "bias"), buf("rs"), buf("ids"), buf("wts"), var(T))
-        step(n + "routing", "routing", buf("ids"), buf("counts"), buf("cta_batch"), buf("cta_limit"), buf("nne"),
-             buf("tpad"), buf("route_map"), buf("exp2perm"))
-        step(n + "psum", "moe_psum", buf("counts"), buf("psum"))
+        step(n + "route", "moe_route", buf("ids"), buf("hist"), buf("psum"), buf("exp2perm"), var(T))
         step(n + "gather", "moe_gather", buf("xq"), buf("xsf"), i32(chunk), buf("exp2perm"), buf("mq"), buf("msf"),
              i32(mcap))
         gemm(n + "fc1", "moe.gu", "mq", n + "w_13", "g13", a_sf="msf")

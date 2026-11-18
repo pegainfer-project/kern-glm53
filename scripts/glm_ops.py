@@ -1,6 +1,6 @@
 """The vendored kernels as manifest ops. Each launch's tensor maps and parameter blocks are laid out the
 way the upstream host code builds them (DeepGEMM's `make_tma_*_desc`, FlashMLA's sparse prefill
-`run()`, FlashInfer's `runPostTopKPipeline`, vLLM's `top_k_per_row_prefill`), so the manifest carries
+`run()`, vLLM's `top_k_per_row_prefill`), so the manifest carries
 the whole launch and no host code runs."""
 import math
 
@@ -221,77 +221,21 @@ def flash_mla(rows, entry, kv):
                                          params=["bytes<144>", "bytes<1280>"], args=[params, tma])]}}
 
 
-# ---- FlashInfer's routing over precomputed top-k (kern-k3-pp-prefill's prebuilt cubin):
-# routingPrecomputed::KernelParams<float, 1024, 16>, runtime top-k 8
-ROUTING_OFF = {
-    "mIsPow2": 1, "mPtrExpertCounts": 8, "mPtrPermutedIdxSize": 16, "mPtrExpandedIdxToPermutedIdx": 24,
-    "mPtrPermutedIdxToTokenIdx": 40, "mPtrCtaIdxXyToBatchIdx": 48, "mPtrCtaIdxXyToMnLimit": 56,
-    "mPtrNumNonExitingCtas": 64, "mPtrTopKIds": 80, "mNumTokens": 96, "mNumExperts": 100, "mPaddingLog2": 104,
-    "mTileTokensDim": 108, "mLocalExpertsStartIdx": 112, "mNumLocalExperts": 120, "mTopK": 176,
-}
-ROUTING_T = "_ZN3moe3dev7routing{}INS1_18routingPrecomputed12KernelParamsIfLi1024ELi16EEEEEvT_"
-ROUTING_THREADS = 1024
+# ---- the routing tables (source/glm_moe.cu): a tally of each slice of ROUTE_SLICE tokens, then the experts'
+# offsets and every routed row's place
+ROUTE_SLICE = 256
 
 
-def fast_div(d):
-    """trtllm's IntFastDiv(d) as its four i32 fields (d, M, s, n_add_sign), Hacker's Delight 10-1."""
-    two31 = 1 << 31
-    ad = abs(d)
-    t = two31 + ((d & 0xFFFFFFFF) >> 31)
-    anc = t - 1 - t % ad
-    p, q1, r1, q2, r2 = 31, two31 // anc, two31 - (two31 // anc) * anc, two31 // ad, two31 - (two31 // ad) * ad
-    while True:
-        p += 1
-        q1, r1 = 2 * q1, 2 * r1
-        if r1 >= anc:
-            q1, r1 = q1 + 1, r1 - anc
-        q2, r2 = 2 * q2, 2 * r2
-        if r2 >= ad:
-            q2, r2 = q2 + 1, r2 - ad
-        delta = ad - r2
-        if not (q1 < delta or (q1 == delta and r1 == 0)):
-            break
-    m = (q2 + 1) & 0xFFFFFFFF
-    m = m - (1 << 32) if m >= two31 else m
-    return [d, m, p - 32, 1 if d > 0 and m < 0 else (-1 if d < 0 and m > 0 else 0)]
-
-
-assert fast_div(16) == [16, -2147483647, 3, 1]
-
-
-def counts_len(experts):
-    return max(512, 2 * experts)
-
-
-def routing(experts, topk, tiles):
-    """Interface: ids i32 [tokens, topk], counts [counts_len], cta_batch, cta_limit, num_non_exiting,
-    total_padded, route_map, exp2perm [tokens, topk]. After it, counts[e] is expert e's row count and
-    expanded row (t, k) sits at exp2perm[t * topk + k]: expert e's rows from `tile` * its CTA offset.
-    `tiles`: [(when, tile)], the padding of each row-count range."""
-    P = {n: i for i, n in enumerate(["ids", "counts", "cta_batch", "cta_limit", "num_non_exiting", "total_padded",
-                                     "route_map", "exp2perm"])}
-    ptr = lambda f, p: {"at": ROUTING_OFF[f], "param": P[p]}
-    i32 = lambda f, v: {"at": ROUTING_OFF[f], "i32": v}
-
-    def pack(tile):
-        fields = [
-            {"at": ROUTING_OFF["mIsPow2"], "u8": 1},
-            ptr("mPtrExpertCounts", "counts"), ptr("mPtrPermutedIdxSize", "total_padded"),
-            ptr("mPtrExpandedIdxToPermutedIdx", "exp2perm"), ptr("mPtrPermutedIdxToTokenIdx", "route_map"),
-            ptr("mPtrCtaIdxXyToBatchIdx", "cta_batch"), ptr("mPtrCtaIdxXyToMnLimit", "cta_limit"),
-            ptr("mPtrNumNonExitingCtas", "num_non_exiting"), ptr("mPtrTopKIds", "ids"),
-            {"at": ROUTING_OFF["mNumTokens"], "var": T}, i32("mNumExperts", experts),
-            i32("mPaddingLog2", tile.bit_length() - 1), i32("mTileTokensDim", tile), i32("mLocalExpertsStartIdx", 0),
-            i32("mNumLocalExperts", experts),
-            *({"at": ROUTING_OFF["mTopK"] + 4 * j, "i32": w} for j, w in enumerate(fast_div(topk))),
-        ]
-        return {"pack": {"size": 192, "fields": sorted(fields, key=lambda f: f["at"])}}
-
-    expanded = {"ceil_div": [{"mul": [T, topk]}, 8 * ROUTING_THREADS]}
-    l = lambda kind, grid, when, tile: launch(
-        "flashinfer_moe_routing", ROUTING_T.format(kind), [grid, 1, 1], [ROUTING_THREADS, 1, 1], params=["bytes<192>"],
-        args=[pack(tile)], **({"when": when} if len(tiles) > 1 else {}))
-    return {"params": ["in buffer<i32>", *["out buffer<i32>"] * 7],
-            "impl": {"launches": [l(k, g, w, t) for w, t in tiles for k, g in (
-                ("23routingInitExpertCounts", -(-counts_len(experts) // ROUTING_THREADS)),
-                ("29routingIndicesHistogramKernel", expanded), ("27routingIndicesOffsetsKernel", expanded))]}}
+def moe_route(experts, tiles):
+    """Interface: ids i32 [tokens, 8], hist i32 [slices, experts] (scratch), psum i32 [experts] out, exp2perm
+    i32 [tokens, 8] out, tokens. Expert e's rows start at its `tile`-aligned offset and end at psum[e]; routed row
+    (t, k) sits at exp2perm[t * 8 + k], an expert's rows in token order. `tiles`: [(when, tile)]."""
+    grid = [{"ceil_div": [T, ROUTE_SLICE]}, 1, 1]
+    count = launch("glm_moe", "glm_moe_count", grid, [ROUTE_SLICE, 1, 1],
+                   params=["in buffer<i32>", "i32", "out buffer<i32>"], args=[{"param": 0}, {"param": 4}, {"param": 1}])
+    place = [launch("glm_moe", "glm_moe_place", grid, [ROUTE_SLICE, 1, 1],
+                    params=["in buffer<i32>", "i32", "in buffer<i32>", "i32", "out buffer<i32>", "out buffer<i32>"],
+                    args=[{"param": 0}, {"param": 4}, {"param": 1}, {"i32": tile}, {"param": 2}, {"param": 3}],
+                    **({"when": w} if len(tiles) > 1 else {})) for w, tile in tiles]
+    return {"params": ["in buffer<i32>", "out buffer<i32>", "out buffer<i32>", "out buffer<i32>", "i32"],
+            "impl": {"launches": [count, *place]}}

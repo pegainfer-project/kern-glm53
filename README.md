@@ -31,8 +31,8 @@ checkpoint (GLM-5.2-FP8 has the same tensors).
   page-blocked (132 bytes a token).
 - **Sparse attention at every length.** A row attends the top 2048 keys its indexer picked, and every
   key when its sequence has at most 2048, which is dense attention through the sparse kernel.
-- **MoE.** FlashInfer's routing tables over the router's top-8, then DeepGEMM's m-grouped fp8 GEMM in
-  its psum layout, so only each expert's own row blocks run.
+- **MoE.** Routing tables over the router's top-8 (an expert's rows in token order), then DeepGEMM's
+  m-grouped fp8 GEMM in its psum layout, so only each expert's own row blocks run.
 
 ## Kernels
 
@@ -42,10 +42,10 @@ checkpoint (GLM-5.2-FP8 has the same tensors).
 | `glm_flashmla` | sparse MLA prefill, 64 heads, d_qk 576 | new upstream: FlashMLA `4f38f29e`, MIT |
 | `k31_topk` | the indexer's top-2048 per row of bf16 logits: vLLM's set, ascending, the same bytes every run | from kern-k31 `f4ddc91` (`source/k31/`) |
 | `glm_glue` | norms, quantization, rope, cache writes, row plan, MoE gather / combine | ours, after vLLM's GLM-5 math |
+| `glm_moe` | MoE routing tables (the psum layout, each routed row's place) | ours |
 | `glm_prep` | load-time UE8M0 re-quantization, kv_b split, the routed scaling fill | ours, after vLLM's `requant_weight_ue8m0` |
 | `k3_router_argmax+EXPERTS=256+TOPK=8` | router top-8, vocab argmax | rebuilt from K3 with new defines (`source/k3/README.md`) |
 | `copy_rows` | each sequence's last row | reused from K3 |
-| `flashinfer_moe_routing` | MoE routing tables | reused from K3 (prebuilt, Apache-2.0, `prebuilt/LICENSE.flashinfer`) |
 | `embedding`, `weight_prep` | embedding gather, rope table, fills | reused from kern's kernel index |
 
 ## Licenses
@@ -53,8 +53,7 @@ checkpoint (GLM-5.2-FP8 has the same tensors).
 Our sources (`source/glm_*.cu`, `scripts/`) are Apache-2.0 (`LICENSE`), as are those copied from
 kern-k3-pp-prefill (`source/k3/`) and kern-k31 (`source/k31/`). DeepGEMM and FlashMLA are git submodules under `third_party/` at
 the commits `kernels.toml` pins, MIT-licensed by DeepSeek (their own `LICENSE`); `source/glm_deepgemm.cu`
-and `source/glm_flashmla.cu` only instantiate their templates. FlashInfer's routing cubin carries its
-own license (`prebuilt/LICENSE.flashinfer`).
+and `source/glm_flashmla.cu` only instantiate their templates.
 
 `scripts/flashmla_probe.cu` records FlashMLA's launch parameter blocks without a GPU (upstream's host
 code run against stand-ins for the CUDA calls); `scripts/glm_ops.py` lays them out from that record.
