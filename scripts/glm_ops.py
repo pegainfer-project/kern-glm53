@@ -47,7 +47,7 @@ def nulled(mod, entry, params, null, grid, block):
 
 
 # ---- DeepGEMM sm100 fp8 1d1d: e4m3 x e4m3 -> bf16, UE8M0 scales packed four to an i32 (MN-major)
-FP8_TILE = {128: (5, 202752), 256: (3, 185344)}  # BN -> (stages, shared memory)
+FP8_TILE = {32: (10, 232448), 64: (7, 212992), 128: (5, 202752), 256: (3, 185344)}  # BN -> (stages, shared memory)
 # grouped swap-AB, BN 128 over a 2-CTA cluster: BM -> (stages, shared memory) (source/glm_deepgemm.cu)
 FP8_SWAP_TILE = {32: (11, 223232), 64: (10, 224256), 128: (8, 214016), 256: (6, 215040)}
 FP8_ENTRY = ("_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj128ELj128ELj0ELj0ELj0"

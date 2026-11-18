@@ -26,6 +26,16 @@ using bf16 = cutlass::bfloat16_t;
         epilogue::transform::EpilogueIdentity>);                                                        \
     asm volatile("" ::"l"(p)); }
 
+// Narrow BN for few rows: more CTAs over the weight. SWZ is the C/D swizzle (BN bf16 bytes, at most 128).
+#define GLM_FP8_NARROW(BN, STAGES, SWZ, SMEM)                                                             \
+  static_assert(sizeof(layout::SM100FP8FP4GemmSharedStorage<STAGES, 2, 2, 128, BN, 128, 128, SWZ / 2, 128, \
+                                                            128, 1, e4m3, e4m3, bf16>) == SMEM);         \
+  { auto p = reinterpret_cast<void*>(&sm100_fp8_fp4_gemm_1d1d_impl<                                       \
+        cute::UMMA::Major::K, cute::UMMA::Major::K, 128, 128, 128, 0, 0, 0, 128, BN, 128, 1,             \
+        128, 128, SWZ, STAGES, 2, 128, 128, 1, true, 152, false, false, GemmType::Normal, false, e4m3,   \
+        e4m3, bf16, epilogue::transform::EpilogueIdentity>);                                              \
+    asm volatile("" ::"l"(p)); }
+
 // Swap-AB (UMMA M over the weight rows, N over the tokens), BLOCK_N 128, the token block split over a
 // 2-CTA cluster: DeepGEMM's own choice for its m-grouped GEMMs, BLOCK_M the psum layout's alignment.
 #define GLM_FP8_SWAP(BM, STAGES, MC, GROUPS, SMEM)                                                       \
@@ -55,6 +65,8 @@ void glm_instantiate() {
   GLM_FP8(128, 256, 3, GemmType::Normal, 1, 185344)
   GLM_FP8(128, 128, 5, GemmType::MGroupedContiguousWithPsumLayout, 256, 202752)
   GLM_FP8(128, 256, 3, GemmType::MGroupedContiguousWithPsumLayout, 256, 185344)
+  GLM_FP8_NARROW(32, 10, 64, 232448)
+  GLM_FP8_NARROW(64, 7, 128, 212992)
   GLM_FP8_SWAP(32, 11, 2, 256, 223232)
   GLM_FP8_SWAP(64, 10, 2, 256, 224256)
   GLM_FP8_SWAP(128, 8, 2, 256, 214016)

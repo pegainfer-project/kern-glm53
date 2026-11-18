@@ -80,6 +80,8 @@ def mla_entry():
     return entry
 
 
+# the shared expert's GEMMs by row count: BN 32 / 64 for few rows put 64-128 CTAs on the weight
+SHARED_TILES = {"shared.gu": "256:n32,1024:n64,16384:n", "shared.dn": "256:n64,16384:n"}
 # the routed GEMMs' layout by row count (DeepGEMM's m-grouped choice: swap-AB, BN 128, a 2-CTA cluster)
 MOE_TILES = "16384:s128"
 
@@ -212,6 +214,9 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
     for k, a in gemms.items():
         if k.startswith("moe."):
             ls = [G.fp8_gemm(*a, swap_bm=bm, when=w) for w, bm in layouts]
+            ops["fp8." + k] = {"params": ls[0][1], "impl": {"launches": [l for l, _ in ls]}}
+        elif k in SHARED_TILES:
+            ls = [G.fp8_gemm(*a, bn=bn, when=w) for w, bn in moe_layouts(SHARED_TILES[k], chunk)]
             ops["fp8." + k] = {"params": ls[0][1], "impl": {"launches": [l for l, _ in ls]}}
         else:
             ops["fp8." + k] = G.fp8_op(*a)
