@@ -3,7 +3,8 @@
 #
 # Cherry-picks SHA without committing, builds (the pins must hold), generates the sub-model, A/Bs main's base
 # against it (loop/ab, two pairs) and runs the numerics gate against main (loop/longcheck). Prints both. Then,
-# only with LAND=1: appends the HISTORY.md row (main's commit it lands after, scores from the A/B's B side, Δ all against
+# only with LAND=1 and the gate passing (all lower, short and long not up beyond 0.3%, longcheck inside
+# TASK.md's floor): appends the HISTORY.md row (main's commit it lands after, scores from the A/B's B side, Δ all against
 # the row above, launches, the gate's long line, NOTE) and commits the pick with SHA's message and author; main's base moves to it
 # (manifests, bench report, recordings). Without LAND=1 the pick is left staged for a look; `git reset --hard`
 # drops it.
@@ -21,6 +22,21 @@ mkdir -p "$work"
 "$LOOP_DIR/ab" "$base/l11.json" "$work/l11.json" "$work/ab" 2 | tee "$work/ab.txt"
 "$LOOP_DIR/longcheck" "$work/l11.json" "$work/lc" | tee "$work/lc.txt"
 [[ ${LAND:-0} == 1 ]] || { echo "land: staged, not committed (LAND=1 to commit)"; exit 0; }
+python3 - "$work/ab.txt" "$work/lc.txt" <<'PY' || { echo "land: held, staged for a look"; exit 1; }
+import re, sys
+ab, lc = open(sys.argv[1]).read(), open(sys.argv[2]).read()
+d = {k: float(v) for k, v in re.findall(r"(short|long|all) [\d.]+ -> [\d.]+ ms \(([-+][\d.]+)%\)", ab)}
+floor = {"long": (90.8, 4, 0.075), "short": (94.3, 2, 0.045)}
+def within(name):
+    m = re.search(rf"^{name} +positions \d+ · top-1 ([\d.]+)% · flips \d+ \(confident (\d+)\) · \|dlp\| mean ([\d.]+)", lc, re.M)
+    top1, conf, dlp = floor[name]
+    return bool(m) and float(m[1]) >= top1 and int(m[2]) <= conf and float(m[3]) <= dlp
+why = [w for w, bad in [("all not lower", d.get("all", 0) >= 0), ("short up", d.get("short", 0) > 0.3),
+                        ("long up", d.get("long", 0) > 0.3), ("long outside the floor", not within("long")),
+                        ("short outside the floor", not within("short"))] if bad]
+print("gate: " + ("pass" if not why else "; ".join(why)))
+sys.exit(1 if why else 0)
+PY
 
 scores=$(python3 - "$work/ab" "$LOOP_DIR" <<'PY'
 import importlib.machinery, importlib.util, json, statistics, sys
