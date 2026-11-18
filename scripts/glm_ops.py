@@ -32,6 +32,15 @@ def launch(mod, entry, grid, block, smem=0, params=None, args=None, **extra):
     return l
 
 
+def picked(mod, entry, params, flags, grid, block, rows):
+    """An entry taking an optional flag buffer at `flags`: passed up to `rows` rows, nullptr past them."""
+    null = [{"i64": 0} if i == flags else {"param": i} for i in range(len(params))]
+    return {"params": params, "impl": {"launches": [
+        launch(mod, entry, grid, block, when={"var": T, "max": rows}),
+        launch(mod, entry, grid, block, params=[("i64" if i == flags else p) for i, p in enumerate(params)],
+               args=null, when={"var": T, "min": rows + 1})]}}
+
+
 def plain(mod, entry, params, grid, block, smem=0):
     return {"params": params, "impl": {"launches": [launch(mod, entry, grid, block, smem)]}}
 

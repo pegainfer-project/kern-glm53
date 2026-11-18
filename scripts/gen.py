@@ -58,6 +58,7 @@ EXPERTS, TOPK, INTER, DENSE_I = 256, 8, 2048, 12288
 LAYERS, DENSE = 78, 3
 FULL = {0, 1, 2} | set(range(6, LAYERS, 4))  # config.json indexer_types == "full"
 PAGE = 64
+PICK_ROWS = 2048                        # kv_dequant lifts only the picked rows of calls up to this many
 IDX_ROW = ID + 4                       # e4m3 key then its f32 scale, page-blocked
 NA = {True: QL + MLA + ID, False: QL + MLA}   # [q_a | kv_a | k_pe | wk]
 NB = {True: QB + IQB, False: QB}
@@ -138,16 +139,19 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
                                   [T, 1, 1], [256, 1, 1]),
         "idx_gather": G.plain("glm_glue", "glm_idx_gather",
                               ["in state", "in buffer<i32>", "i32", "in buffer<i32>", "i32", "out buffer<u8>",
-                               "out buffer<f32>"], [{"add": [{"ceil_div": [CTX, PAGE]}, S]}, 1, 1], [256, 1, 1]),
+                               "out buffer<f32>", "out buffer<u8>"], [{"add": [{"ceil_div": [CTX, PAGE]}, S]}, 1, 1],
+                              [256, 1, 1]),
         "topk_slots": G.plain("glm_glue", "glm_topk_slots",
                               ["inout buffer<i32>", "in buffer<i32>", "i32", "in buffer<i32>", "in buffer<i32>",
                                "out buffer<i32>", "i32"], [T, 1, 1], [256, 1, 1]),
-        "topk_stream": G.plain("glm_glue", "glm_topk_stream",
-                               ["inout buffer<i32>", "in buffer<u32>", "in buffer<i32>", "out buffer<i32>", "i32"],
-                               [T, 1, 1], [256, 1, 1]),
-        "kv_dequant": G.plain("glm_glue", "glm_kv_dequant",
-                              ["in state", "in buffer<i32>", "i32", "in buffer<i32>", "i32", "out buffer<bf16>"],
-                              [{"add": [{"ceil_div": [CTX, PAGE]}, S]}, 1, 1], [256, 1, 1]),
+        # the pick flags pay off while a chunk picks a small part of its context: up to PICK_ROWS rows
+        "topk_stream": G.picked("glm_glue", "glm_topk_stream",
+                                ["inout buffer<i32>", "in buffer<u32>", "in buffer<i32>", "out buffer<i32>",
+                                 "inout buffer<u8>", "i32"], 4, [T, 1, 1], [256, 1, 1], PICK_ROWS),
+        "kv_dequant": G.picked("glm_glue", "glm_kv_dequant",
+                               ["in state", "in buffer<i32>", "i32", "in buffer<i32>", "i32", "in buffer<u8>",
+                                "out buffer<bf16>"], 5, [{"add": [{"ceil_div": [CTX, PAGE]}, S]}, 1, 1], [256, 1, 1],
+                               PICK_ROWS),
         "uk": G.bf16_batched(KVL, NOPE, chunk, (NB[True] * 2, (NOPE + ROPE) * 2), (NOPE * 2, KVL * NOPE * 2),
                              (HEADS * MLA * 2, MLA * 2)),
         "uv": G.vup_quant(VD, KVL, chunk, (HEADS * KVL * 2, KVL * 2), (KVL * 2, (NOPE + VD) * KVL * 2)),
@@ -298,6 +302,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
     work("wout", [T, IH], "f32")
     work("kg", [max_ctx, ID], "u8")
     work("ksf", [max_ctx], "f32")
+    work("pick", [max_ctx], "u8")
     work("logits", [sub * max_ctx])
     work("imeta", [G.meta_words(sub)], "i32")
     work("ind", [T, G.TOPK], "i32")
@@ -402,7 +407,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
             step(n + "q_post", "q_post_full", buf("qb"), i32(NB[True]), buf("rope"), buf("pos"), buf("qmla"), buf("iq"),
                  buf("iw"), buf("wout"), i32(1), var(T))
             step(n + "idx_gather", "idx_gather", st(f"idx.{l}"), buf("block_table"), i32(max_pages), buf("seq_lens"),
-                 var(S), buf("kg"), buf("ksf"))
+                 var(S), buf("kg"), buf("ksf"), buf("pick"))
             for j in range(chunk // sub):
                 r0 = j * sub
                 step(f"{n}indexer.{j}", f"indexer.{j}", buf("iq", r0 * IQB), buf("kg"), buf("ksf"),
@@ -411,7 +416,8 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
                      expr({"clamp": [T, r0, sub]}), var(CTX), expr({"mul": [{"ceil_div": [CTX, 256]}, 256]}),
                      buf("imeta"))
             if fp8kv:
-                step(n + "topk_stream", "topk_stream", buf("ind"), buf("ks"), buf("klen"), buf("tlen"), var(T))
+                step(n + "topk_stream", "topk_stream", buf("ind"), buf("ks"), buf("klen"), buf("tlen"), buf("pick"),
+                     var(T))
             else:
                 step(n + "topk_slots", "topk_slots", buf("ind"), buf("block_table"), i32(max_pages), buf("row_seq"),
                      buf("klen"), buf("tlen"), var(T))
@@ -420,7 +426,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
                  i32(0), var(T))
         if fp8kv:
             step(n + "kv_dequant", "kv_dequant", kv, buf("block_table"), i32(max_pages), buf("seq_lens"), var(S),
-                 buf("kvd"))
+                 buf("pick"), buf("kvd"))
         step(n + "attn", "flash_mla", buf("qmla"), buf("qmla", KVL * 2), buf("kvd") if fp8kv else kv, buf("ind"),
              buf("tlen"), buf("o"), buf("ml"), buf("lse"))
         step(n + "uv", "uv", buf("o"), buf(n + "kvb", NOPE * KVL * 2), buf("oq"), buf("osf"), var(T))

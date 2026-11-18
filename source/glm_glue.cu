@@ -377,11 +377,12 @@ extern "C" __global__ void __launch_bounds__(256) glm_q_post(
 
 // The indexer keys of every sequence, back to back: page j of sequence s (its rows
 // [64 j, min(64 j + 64, len))) lands at stream rows goff(s) + 64 j, values in kg [., 128] and
-// scales in ksf. A block a page; blocks past the last page return.
+// scales in ksf; the rows' pick flags (glm_topk_stream) cleared. A block a page; blocks past the last
+// page return.
 //   grid (ceil(ctx / 64) + seqs), block 256
 extern "C" __global__ void glm_idx_gather(const u8* __restrict__ idx, const int* __restrict__ block_table,
                                           int max_pages, const int* __restrict__ seq_lens, int nseq,
-                                          u8* __restrict__ kg, float* __restrict__ ksf) {
+                                          u8* __restrict__ kg, float* __restrict__ ksf, u8* __restrict__ pick) {
   int b = blockIdx.x, s = 0;
   unsigned goff = 0;
   for (; s < nseq; ++s) {
@@ -397,16 +398,20 @@ extern "C" __global__ void glm_idx_gather(const u8* __restrict__ idx, const int*
   const uint4* sv = reinterpret_cast<const uint4*>(src);
   uint4* dv = reinterpret_cast<uint4*>(kg + d * ID);
   for (int i = threadIdx.x; i < n * (ID / 16); i += blockDim.x) dv[i] = sv[i];
-  if (threadIdx.x < n) ksf[d + threadIdx.x] = reinterpret_cast<const float*>(src + PAGE * ID)[threadIdx.x];
+  if (threadIdx.x < n) {
+    ksf[d + threadIdx.x] = reinterpret_cast<const float*>(src + PAGE * ID)[threadIdx.x];
+    pick[d + threadIdx.x] = 0;
+  }
 }
 
 // The fp8 latent rows of every sequence lifted to bf16 back to back, the same stream as glm_idx_gather's:
 // page j of sequence s lands at rows goff(s) + 64 j of kvd [., 576], each value bf16(e4m3 * its tile's
-// scale) as SGLang's dequantize_k_cache_paged. A block a page, a warp a row; blocks past the last page return.
+// scale) as SGLang's dequantize_k_cache_paged; with `pick` (may be null) only the rows some row's top-k
+// picked (the indexer layer's flags). A block a page, a warp a row; blocks past the last page return.
 //   grid (ceil(ctx / 64) + seqs), block 256
 extern "C" __global__ void glm_kv_dequant(const u8* __restrict__ kv, const int* __restrict__ block_table,
                                           int max_pages, const int* __restrict__ seq_lens, int nseq,
-                                          bf16* __restrict__ kvd) {
+                                          const u8* __restrict__ pick, bf16* __restrict__ kvd) {
   int b = blockIdx.x, s = 0;
   unsigned goff = 0;
   for (; s < nseq; ++s) {
@@ -418,7 +423,9 @@ extern "C" __global__ void glm_kv_dequant(const u8* __restrict__ kv, const int* 
   if (s == nseq) return;
   const int n = min(PAGE, seq_lens[s] - b * PAGE), w = threadIdx.x >> 5, l = threadIdx.x & 31;
   const u8* page = kv + (size_t)block_table[(size_t)s * max_pages + b] * PAGE * KV8;
+  const u8* picked = pick ? pick + goff + (size_t)b * PAGE : nullptr;
   for (int i = w; i < n; i += 8) {
+    if (picked && !picked[i]) continue;
     const u8* src = page + (size_t)i * KV8;
     u8* dst = reinterpret_cast<u8*>(kvd + (goff + (size_t)b * PAGE + i) * MLA);
     const uint4 q = *reinterpret_cast<const uint4*>(src + l * 16);
@@ -439,15 +446,19 @@ extern "C" __global__ void glm_kv_dequant(const u8* __restrict__ kv, const int* 
 }
 
 // The top-k's sequence-relative key indices (-1 past a short row's keys) as rows of glm_kv_dequant's
-// stream, in place, and the row's live count min(klen, 2048) for the attention.
+// stream, in place, each picked row flagged in `pick` (may be null), and the row's live count
+// min(klen, 2048) for the attention.
 //   grid (T), block 256
 extern "C" __global__ void glm_topk_stream(int* __restrict__ ind, const unsigned* __restrict__ ks,
-                                           const int* __restrict__ klen, int* __restrict__ tlen, int T) {
+                                           const int* __restrict__ klen, int* __restrict__ tlen,
+                                           u8* __restrict__ pick, int T) {
   const int r = blockIdx.x;
   int* row = ind + (size_t)r * TOPK;
   for (int i = threadIdx.x; i < TOPK; i += blockDim.x) {
     const int k = row[i];
-    row[i] = k < 0 ? -1 : (int)ks[r] + k;
+    const int j = k < 0 ? -1 : (int)ks[r] + k;
+    row[i] = j;
+    if (pick && j >= 0) pick[j] = 1;
   }
   if (threadIdx.x == 0) tlen[r] = min(klen[r], TOPK);
 }
