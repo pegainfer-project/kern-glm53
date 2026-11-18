@@ -174,6 +174,17 @@ extern "C" __global__ void glm_quant(const bf16* __restrict__ x, int ldx, u8* __
   quant4(v, q + (size_t)r * K + c, sf, sf_rows, r, kb, 1e-10f);
 }
 
+__device__ __forceinline__ void silu_quant(const bf16* __restrict__ gu, int I, u8* __restrict__ q, u8* __restrict__ sf,
+                                           int sf_rows, int r, int kb) {
+  const int c = kb * 128 + (threadIdx.x & 31) * 4;
+  float g[4], u[4], v[4];
+  ld4(gu + (size_t)r * 2 * I + c, g);
+  ld4(gu + (size_t)r * 2 * I + I + c, u);
+#pragma unroll
+  for (int j = 0; j < 4; ++j) v[j] = rnd(g[j] / (1.f + __expf(-g[j])) * u[j]);
+  quant4(v, q + (size_t)r * I + c, sf, sf_rows, r, kb, 1e-10f);
+}
+
 // act = bf16(silu(g) * u) over gate | up halves of gu [rows, 2I], quantized per 128 columns into
 // q [rows, I]. `n` (may be null) holds the live row count; rows past it are skipped.
 //   grid (ceil(rows * I / 1024)), block 256
@@ -183,14 +194,22 @@ extern "C" __global__ void glm_silu_mul_quant(const bf16* __restrict__ gu, int I
   const long long gw = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const int nb = I >> 7;
   if (gw >= (long long)rows * nb) return;
-  const int r = (int)(gw / nb), kb = (int)(gw % nb), c = kb * 128 + (threadIdx.x & 31) * 4;
+  const int r = (int)(gw / nb), kb = (int)(gw % nb);
   if (n && r >= *n) return;
-  float g[4], u[4], v[4];
-  ld4(gu + (size_t)r * 2 * I + c, g);
-  ld4(gu + (size_t)r * 2 * I + I + c, u);
-#pragma unroll
-  for (int j = 0; j < 4; ++j) v[j] = rnd(g[j] / (1.f + __expf(-g[j])) * u[j]);
-  quant4(v, q + (size_t)r * I + c, sf, sf_rows, r, kb, 1e-10f);
+  silu_quant(gu, I, q, sf, sf_rows, r, kb);
+}
+
+// glm_silu_mul_quant over the routed rows only: expanded row e = t * 8 + k at permuted row exp2perm[e],
+// the experts' padding rows untouched.
+//   grid (ceil(T * 8 * I / 1024)), block 256
+extern "C" __global__ void glm_silu_moe(const bf16* __restrict__ gu, int I, const int* __restrict__ exp2perm,
+                                        u8* __restrict__ q, u8* __restrict__ sf, int sf_rows, int T) {
+  const long long gw = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int nb = I >> 7;
+  if (gw >= (long long)T * 8 * nb) return;
+  const int p = exp2perm[gw / nb];
+  if (p < 0) return;
+  silu_quant(gu, I, q, sf, sf_rows, p, (int)(gw % nb));
 }
 
 // The projection [q_a 2048 | kv_a 512 | k_pe 64 | wk 128] of a row (bf16, lda apart):

@@ -109,11 +109,9 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0):
         "silu_shared": G.nulled("glm_glue", "glm_silu_mul_quant",
                                 ["in buffer<bf16>", "i32", "out buffer<u8>", "out buffer<u8>", "i32", "in buffer<i32>",
                                  "i32"], {5}, [{"mul": [T, INTER // 1024]}, 1, 1], [256, 1, 1]),
-        # the routed rows past the padded count return at once; the grid covers the bound of that count
-        "silu_moe": G.plain("glm_glue", "glm_silu_mul_quant",
-                            ["in buffer<bf16>", "i32", "out buffer<u8>", "out buffer<u8>", "i32", "in buffer<i32>", "i32"],
-                            [{"add": [{"mul": [T, TOPK * INTER // 1024]}, EXPERTS * 128 * INTER // 1024]}, 1, 1],
-                            [256, 1, 1]),
+        "silu_moe": G.plain("glm_glue", "glm_silu_moe",
+                            ["in buffer<bf16>", "i32", "in buffer<i32>", "out buffer<u8>", "out buffer<u8>", "i32", "i32"],
+                            [{"mul": [T, TOPK * INTER // 1024]}, 1, 1], [256, 1, 1]),
         "q_post_full": G.plain("glm_glue", "glm_q_post",
                                ["in buffer<bf16>", "i32", "in buffer<bf16>", "in buffer<i32>", "inout buffer<bf16>",
                                 "out buffer<u8>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32"], [T, 1, 1], [256, 1, 1]),
@@ -440,7 +438,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0):
         step(n + "gather", "moe_gather", buf("xq"), buf("xsf"), i32(chunk), buf("exp2perm"), buf("mq"), buf("msf"),
              i32(mcap))
         gemm(n + "fc1", "moe.gu", "mq", n + "w_13", "g13", a_sf="msf")
-        step(n + "silu", "silu_moe", buf("g13"), i32(INTER), buf("mq2"), buf("msf2"), i32(mcap), buf("tpad"), i32(mcap))
+        step(n + "silu", "silu_moe", buf("g13"), i32(INTER), buf("exp2perm"), buf("mq2"), buf("msf2"), i32(mcap), var(T))
         gemm(n + "fc2", "moe.dn", "mq2", n + "w_2", "f2", a_sf="msf2")
         gemm(n + "sgu", "shared.gu", "xq", n + "w_sgu", "sg")
         step(n + "ssilu", "silu_shared", buf("sg"), i32(INTER), buf("sq"), buf("ssf"), i32(chunk), var(T))
