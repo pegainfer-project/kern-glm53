@@ -125,12 +125,11 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
         "silu_dense": G.nulled("glm_glue", "glm_silu_mul_quant",
                                ["in buffer<bf16>", "i32", "out buffer<u8>", "out buffer<u8>", "i32", "in buffer<i32>",
                                 "i32"], {5}, [{"mul": [T, DENSE_I // 1024]}, 1, 1], [256, 1, 1]),
-        "silu_shared": G.nulled("glm_glue", "glm_silu_mul_quant",
-                                ["in buffer<bf16>", "i32", "out buffer<u8>", "out buffer<u8>", "i32", "in buffer<i32>",
-                                 "i32"], {5}, [{"mul": [T, INTER // 1024]}, 1, 1], [256, 1, 1]),
-        "silu_moe": G.plain("glm_glue", "glm_silu_moe",
-                            ["in buffer<bf16>", "i32", "in buffer<i32>", "out buffer<u8>", "out buffer<u8>", "i32", "i32"],
-                            [{"mul": [T, TOPK * INTER // 1024]}, 1, 1], [256, 1, 1]),
+        "silu_shared": G.nulled("glm_glue", "glm_silu_rows", ["in buffer<bf16>", "in buffer<i32>", "out buffer<u8>",
+                                                             "out buffer<u8>", "i32"], {1}, [T, 1, 1], [256, 1, 1]),
+        "silu_moe": G.plain("glm_glue", "glm_silu_rows",
+                            ["in buffer<bf16>", "in buffer<i32>", "out buffer<u8>", "out buffer<u8>", "i32"],
+                            [{"mul": [T, TOPK]}, 1, 1], [256, 1, 1]),
         "q_post_full": G.plain("glm_glue", "glm_q_post",
                                ["in buffer<bf16>", "i32", "in buffer<bf16>", "in buffer<i32>", "inout buffer<bf16>",
                                 "out buffer<u8>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32"], [T, 1, 1], [256, 1, 1]),
@@ -166,7 +165,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
                      args=[{"param": 0}, {"param": 1}, {"i32": bm or 128}], when=w) for w, bm in layouts]}},
         "moe_gather": G.plain("glm_glue", "glm_moe_gather",
                               ["in buffer<u8>", "in buffer<u8>", "i32", "in buffer<i32>", "out buffer<u8>",
-                               "out buffer<u8>", "i32"], [{"mul": [T, TOPK]}, 1, 1], [256, 1, 1]),
+                               "out buffer<u8>", "i32"], [T, 1, 1], [384, 1, 1]),
         "moe_combine": G.plain("glm_glue", "glm_moe_combine",
                                ["in buffer<bf16>", "in buffer<i32>", "in buffer<f32>", "in buffer<bf16>",
                                 "out buffer<bf16>", "i32"], [T, 1, 1], [256, 1, 1]),
@@ -463,10 +462,10 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
         step(n + "gather", "moe_gather", buf("xq"), buf("xsf"), i32(chunk), buf("exp2perm"), buf("mq"), buf("msf"),
              i32(mcap))
         gemm(n + "fc1", "moe.gu", "mq", n + "w_13", "g13", a_sf="msf")
-        step(n + "silu", "silu_moe", buf("g13"), i32(INTER), buf("exp2perm"), buf("mq2"), buf("msf2"), i32(mcap), var(T))
+        step(n + "silu", "silu_moe", buf("g13"), buf("exp2perm"), buf("mq2"), buf("msf2"), i32(mcap))
         gemm(n + "fc2", "moe.dn", "mq2", n + "w_2", "f2", a_sf="msf2")
         gemm(n + "sgu", "shared.gu", "xq", n + "w_sgu", "sg")
-        step(n + "ssilu", "silu_shared", buf("sg"), i32(INTER), buf("sq"), buf("ssf"), i32(chunk), var(T))
+        step(n + "ssilu", "silu_shared", buf("sg"), buf("sq"), buf("ssf"), i32(chunk))
         gemm(n + "sdn", "shared.dn", "sq", n + "w_sdn", "sh", a_sf="ssf")
         step(n + "combine", "moe_combine", buf("f2"), buf("exp2perm"), buf("wts"), buf("sh"), buf("h"), var(T))
 

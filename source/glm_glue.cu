@@ -174,17 +174,6 @@ extern "C" __global__ void glm_quant(const bf16* __restrict__ x, int ldx, u8* __
   quant4(v, q + (size_t)r * K + c, sf, sf_rows, r, kb, 1e-10f);
 }
 
-__device__ __forceinline__ void silu_quant(const bf16* __restrict__ gu, int I, u8* __restrict__ q, u8* __restrict__ sf,
-                                           int sf_rows, int r, int kb) {
-  const int c = kb * 128 + (threadIdx.x & 31) * 4;
-  float g[4], u[4], v[4];
-  ld4(gu + (size_t)r * 2 * I + c, g);
-  ld4(gu + (size_t)r * 2 * I + I + c, u);
-#pragma unroll
-  for (int j = 0; j < 4; ++j) v[j] = rnd(g[j] / (1.f + __expf(-g[j])) * u[j]);
-  quant4(v, q + (size_t)r * I + c, sf, sf_rows, r, kb, 1e-10f);
-}
-
 // act = bf16(silu(g) * u) over gate | up halves of gu [rows, 2I], quantized per 128 columns into
 // q [rows, I]. `n` (may be null) holds the live row count; rows past it are skipped.
 //   grid (ceil(rows * I / 1024)), block 256
@@ -194,22 +183,45 @@ extern "C" __global__ void glm_silu_mul_quant(const bf16* __restrict__ gu, int I
   const long long gw = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const int nb = I >> 7;
   if (gw >= (long long)rows * nb) return;
-  const int r = (int)(gw / nb), kb = (int)(gw % nb);
+  const int r = (int)(gw / nb), kb = (int)(gw % nb), c = kb * 128 + (threadIdx.x & 31) * 4;
   if (n && r >= *n) return;
-  silu_quant(gu, I, q, sf, sf_rows, r, kb);
+  float g[4], u[4], v[4];
+  ld4(gu + (size_t)r * 2 * I + c, g);
+  ld4(gu + (size_t)r * 2 * I + I + c, u);
+#pragma unroll
+  for (int j = 0; j < 4; ++j) v[j] = rnd(g[j] / (1.f + __expf(-g[j])) * u[j]);
+  quant4(v, q + (size_t)r * I + c, sf, sf_rows, r, kb, 1e-10f);
 }
 
-// glm_silu_mul_quant over the routed rows only: expanded row e = t * 8 + k at permuted row exp2perm[e],
-// the experts' padding rows untouched.
-//   grid (ceil(T * 8 * I / 1024)), block 256
-extern "C" __global__ void glm_silu_moe(const bf16* __restrict__ gu, int I, const int* __restrict__ exp2perm,
-                                        u8* __restrict__ q, u8* __restrict__ sf, int sf_rows, int T) {
-  const long long gw = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-  const int nb = I >> 7;
-  if (gw >= (long long)T * 8 * nb) return;
-  const int p = exp2perm[gw / nb];
-  if (p < 0) return;
-  silu_quant(gu, I, q, sf, sf_rows, p, (int)(gw % nb));
+// glm_silu_mul_quant at I = 2048, a block per row, eight columns a thread: row r of gu at map[r] (map null:
+// r itself; a negative entry is skipped), so the routed rows run at exp2perm's permuted rows only.
+//   grid (rows), block 256
+extern "C" __global__ void __launch_bounds__(256) glm_silu_rows(const bf16* __restrict__ gu,
+                                                                const int* __restrict__ map, u8* __restrict__ q,
+                                                                u8* __restrict__ sf, int sf_rows) {
+  constexpr int I = 2048;
+  const int r = map ? map[blockIdx.x] : blockIdx.x, c = threadIdx.x * 8;
+  if (r < 0) return;
+  const uint4 gw = *reinterpret_cast<const uint4*>(gu + (size_t)r * 2 * I + c);
+  const uint4 uw = *reinterpret_cast<const uint4*>(gu + (size_t)r * 2 * I + I + c);
+  const __nv_bfloat162* g2 = reinterpret_cast<const __nv_bfloat162*>(&gw);
+  const __nv_bfloat162* u2 = reinterpret_cast<const __nv_bfloat162*>(&uw);
+  float v[8], amax = 0.f;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const float2 g = __bfloat1622float2(g2[j]), u = __bfloat1622float2(u2[j]);
+    v[2 * j] = rnd(g.x / (1.f + __expf(-g.x)) * u.x);
+    v[2 * j + 1] = rnd(g.y / (1.f + __expf(-g.y)) * u.y);
+    amax = fmaxf(amax, fmaxf(fabsf(v[2 * j]), fabsf(v[2 * j + 1])));
+  }
+#pragma unroll
+  for (int o = 8; o; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+  u8 e;
+  const float inv = 1.f / ue8m0(amax, 1e-10f, &e);
+  const uint2 out = make_uint2(fp8x4(v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv),
+                               fp8x4(v[4] * inv, v[5] * inv, v[6] * inv, v[7] * inv));
+  *reinterpret_cast<uint2*>(q + (size_t)r * I + c) = out;
+  if ((threadIdx.x & 15) == 0) put_sf(sf, sf_rows, r, threadIdx.x >> 4, e);
 }
 
 // The projection [q_a 2048 | kv_a 512 | k_pe 64 | wk 128] of a row (bf16, lda apart):
@@ -479,22 +491,39 @@ extern "C" __global__ void glm_moe_psum(const int* __restrict__ counts, int* __r
   psum[e] = (sm[e] - b) * tile + c;
 }
 
-// Expanded row (t, k) of the routed activation: token t's e4m3 row and its scale words at permuted
-// row exp2perm[t * 8 + k].
-//   grid (T * 8), block 256
-extern "C" __global__ void glm_moe_gather(const u8* __restrict__ xq, const unsigned* __restrict__ xsf, int x_rows,
-                                          const int* __restrict__ exp2perm, u8* __restrict__ aq,
-                                          unsigned* __restrict__ asf, int a_rows) {
-  const int e = blockIdx.x, t = e >> 3, p = exp2perm[e];
-  if (p < 0) return;
-  const uint4* s = reinterpret_cast<const uint4*>(xq + (size_t)t * H);
-  uint4* d = reinterpret_cast<uint4*>(aq + (size_t)p * H);
-  for (int i = threadIdx.x; i < H / 16; i += blockDim.x) d[i] = s[i];
-  if (threadIdx.x < H / 512) asf[(size_t)threadIdx.x * a_rows + p] = xsf[(size_t)threadIdx.x * x_rows + t];
+// Token t's e4m3 row and its scale words, read once, at each of its routed rows exp2perm[t * 8 + k].
+//   grid (T), block 384: 16 bytes a thread
+extern "C" __global__ void __launch_bounds__(384) glm_moe_gather(const u8* __restrict__ xq,
+                                                                 const unsigned* __restrict__ xsf, int x_rows,
+                                                                 const int* __restrict__ exp2perm,
+                                                                 u8* __restrict__ aq, unsigned* __restrict__ asf,
+                                                                 int a_rows) {
+  const int t = blockIdx.x, i = threadIdx.x;
+  int p[8];
+#pragma unroll
+  for (int k = 0; k < 8; ++k) p[k] = exp2perm[t * 8 + k];
+  const uint4 v = reinterpret_cast<const uint4*>(xq + (size_t)t * H)[i];
+  const unsigned w = i < H / 512 ? xsf[(size_t)i * x_rows + t] : 0u;
+#pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    if (p[k] < 0) continue;
+    reinterpret_cast<uint4*>(aq + (size_t)p[k] * H)[i] = v;
+    if (i < H / 512) asf[(size_t)i * a_rows + p[k]] = w;
+  }
 }
 
 // out[t] = bf16(sum_k wts[t, k] * fc2[exp2perm[t * 8 + k]] + shared[t]), sums in f32.
-//   grid (T), block 256: 24 columns a thread
+//   grid (T), block 256: 24 columns a thread, eight at a time
+__device__ __forceinline__ void ld8(const bf16* p, float v[8]) {
+  const uint4 u = *reinterpret_cast<const uint4*>(p);
+  const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&u);
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const float2 f = __bfloat1622float2(h[j]);
+    v[2 * j] = f.x, v[2 * j + 1] = f.y;
+  }
+}
+
 extern "C" __global__ void __launch_bounds__(256) glm_moe_combine(const bf16* __restrict__ fc2,
                                                                   const int* __restrict__ exp2perm,
                                                                   const float* __restrict__ wts,
@@ -506,17 +535,21 @@ extern "C" __global__ void __launch_bounds__(256) glm_moe_combine(const bf16* __
   if (threadIdx.x < 8) sp[threadIdx.x] = exp2perm[t * 8 + threadIdx.x], sw[threadIdx.x] = wts[t * 8 + threadIdx.x];
   __syncthreads();
 #pragma unroll
-  for (int i = 0; i < 6; ++i) {
-    const int c = (i * 256 + threadIdx.x) * 4;
-    float acc[4], v[4];
-    ld4(shared + (size_t)t * H + c, acc);
+  for (int i = 0; i < 3; ++i) {
+    const int c = (i * 256 + threadIdx.x) * 8;
+    float acc[8], v[8];
+    ld8(shared + (size_t)t * H + c, acc);
 #pragma unroll
     for (int k = 0; k < 8; ++k) {
       if (sp[k] < 0) continue;
-      ld4(fc2 + (size_t)sp[k] * H + c, v);
+      ld8(fc2 + (size_t)sp[k] * H + c, v);
 #pragma unroll
-      for (int j = 0; j < 4; ++j) acc[j] += sw[k] * v[j];
+      for (int j = 0; j < 8; ++j) acc[j] += sw[k] * v[j];
     }
-    st4(out + (size_t)t * H + c, acc);
+    __nv_bfloat162 h[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) h[j] = __floats2bfloat162_rn(acc[2 * j], acc[2 * j + 1]);
+    *reinterpret_cast<uint4*>(out + (size_t)t * H + c) = *reinterpret_cast<const uint4*>(h);
   }
 }
+
