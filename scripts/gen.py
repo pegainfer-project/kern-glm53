@@ -102,10 +102,12 @@ def within(op, lo, hi):
 # the routed GEMMs' layout by row count (DeepGEMM's m-grouped choice: swap-AB, BN 128, a 2-CTA cluster)
 MOE_TILES = "16384:s128"
 # the dense GEMMs' layouts by row count, as moe_layouts reads them (s: swap-AB with that block M on a 2-CTA
-# cluster, n: that BN): at few rows each puts more CTAs on its weight (fp8.o at 128 rows: 96 tiles of 128 weight
-# rows x 64 tokens, not 24 of 128 x 256)
-TILES = {**SHARED_TILES, "o": "512:s64,16384:n", "dense.dn": "512:s64,16384:n", "a.full": "256:n32,16384:n",
-         "a.shared": "256:n32,16384:n", "b.shared": "256:n128,16384:n"}
+# cluster, n: that BN, m: BN 256 on a 2-CTA cluster multicasting the weight tile): at few rows each puts more
+# CTAs on its weight (fp8.o at 128 rows: 96 tiles of 128 weight rows x 64 tokens, not 24 of 128 x 256); from
+# 257 rows the multicast halves the L2 traffic of the weight tiles that bound the plain BN 256 tile
+TILES = {**SHARED_TILES, "o": "256:s64,16384:m", "dense.gu": "256:n,16384:m", "dense.dn": "512:s64,16384:m",
+         "a.full": "256:n32,16384:n", "a.shared": "256:n32,16384:n", "b.full": "256:n,16384:m",
+         "b.shared": "256:n128,16384:m"}
 
 
 def moe_layouts(spec, chunk):
@@ -235,7 +237,8 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
             ops["fp8." + k] = {"params": ls[0][1], "impl": {"launches": [l for l, _ in ls]}}
         elif k in TILES:
             kinds = [part.split(":")[1][:1] for part in TILES[k].split(",")]
-            ls = [G.fp8_gemm(*a, **({"swap_bm": t} if kind == "s" else {"bn": t}), when=w)
+            ls = [G.fp8_gemm(*a, **({"swap_bm": t} if kind == "s" else {"mcb": True} if kind == "m" else {"bn": t}),
+                             when=w)
                   for kind, (w, t) in zip(kinds, moe_layouts(TILES[k], chunk))]
             ops["fp8." + k] = {"params": ls[0][1], "impl": {"launches": [l for l, _ in ls]}}
         else:

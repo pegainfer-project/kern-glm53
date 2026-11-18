@@ -83,7 +83,7 @@ source = "source/k3/copy_rows.cu"
 
 # DeepGEMM sm100 fp8 Normal GEMM, swap-AB on a 2-CTA cluster: the projections at few rows.
 [kernels."glm_fp8_tiles"]
-sha256 = "9aa76a4ef083efd8def69354f5fb0eb02bc7fece71bb08dfeed4703c3538294c"
+sha256 = "71a6124d6230a22091b92fda0f5599b148f896b920da707554bc6f5bed0de195"
 source = "source/glm_fp8_tiles.cu"
 flags = "deepgemm"
 includes = ["deepgemm"]
