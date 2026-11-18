@@ -73,7 +73,7 @@ up() {
     git -C "$clone" worktree add -q -b "agent/$name" "$dir" main
     git -C "$dir" submodule update -q --init --recursive
   fi
-  cp "$LOOP_DIR/local.env" "$dir/loop/local.env"
+  grep -v "^WITHGPU_FIRST=" "$LOOP_DIR/local.env" > "$dir/loop/local.env"
   local deadline
   deadline=$(date -u -d "+$hours hours" +%FT%T)
   { head -n 1 "$roundfile"
