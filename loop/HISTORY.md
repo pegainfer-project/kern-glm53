@@ -33,3 +33,4 @@ is that A/B's. Numerics are `loop/longcheck`'s long pass against the row above.
 | 21 | e9b21ad | routed gate-up epilogue applies silu and quantizes, silu_moe gone | 218.37 | 1006.49 | 249.26 | -1.58% | 584 | top-1 100.000% · flips 0 (confident 0) |
 | 22 | dfd2f45 | MoE combine takes the next layer's input norm when that layer shares the picks | 218.04 | 1004.71 | 248.88 | -0.15% | 579 | top-1 100.000% · flips 0 (confident 0) |
 | 23 | 1a76317 | past 1024 rows the shared expert's GEMMs take the multicast tile | 217.53 | 1004.22 | 248.37 | -0.20% | 587 | top-1 100.000% · flips 0 (confident 0) |
+| 24 | 4f3c271 | o_proj adds into the residual stream, norm_post reads res alone | 217.51 | 1003.12 | 248.31 | -0.03% | 587 | top-1 100.000% · flips 0 (confident 0) |

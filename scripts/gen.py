@@ -211,6 +211,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
     ops["add_rms_quant"] = G.plain("glm_glue", "glm_add_rms_quant", norm_params, [T, 1, 1], [256, 1, 1])
     ops["add_quant"] = G.nulled("glm_glue", "glm_add_rms_quant", norm_params, {3}, [T, 1, 1], [256, 1, 1])
     ops["rms_quant"] = G.nulled("glm_glue", "glm_add_rms_quant", norm_params, {0}, [T, 1, 1], [256, 1, 1])
+    ops["norm_quant"] = G.nulled("glm_glue", "glm_add_rms_quant", norm_params, {0, 3}, [T, 1, 1], [256, 1, 1])
     prep_params = ["in buffer<bf16>", "i32", "in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "in buffer<i32>",
                    "in buffer<i64>", "inout state", "inout state", "in buffer<bf16>", "in buffer<bf16>", "out buffer<u8>",
                    "out buffer<u8>", "i32", "i32"]
@@ -243,7 +244,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
         elif k in TILES:
             kinds = [part.split(":")[1][:1] for part in TILES[k].split(",")]
             ls = [G.fp8_gemm(*a, **({"swap_bm": t} if kind == "s" else {"mcb": True} if kind == "m" else {"bn": t}),
-                             when=w)
+                             acc=k == "o", when=w)
                   for kind, (w, t) in zip(kinds, moe_layouts(TILES[k], chunk))]
             ops["fp8." + k] = {"params": ls[0][1], "impl": {"launches": [l for l, _ in ls]}}
         else:
@@ -473,13 +474,13 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
         step(n + "attn", "flash_mla", buf("qmla"), buf("qmla", KVL * 2), buf("kvd") if fp8kv else kv, buf("ind"),
              buf("tlen"), buf("o"), buf("ml"), buf("lse"), after=[1] if fp8kv and not full else [])
         step(n + "uv", "uv", buf("o"), buf(n + "kvb", NOPE * KVL * 2), buf("oq"), buf("osf"), var(T))
-        gemm(n + "o", "o", "oq", n + "w_o", "h", a_sf="osf")
+        gemm(n + "o", "o", "oq", n + "w_o", "res", a_sf="osf")  # res += o_proj's output (a TMA reduce-add)
         if l < DENSE:
-            step(n + "norm_post", "add_quant", buf("h"), buf("res"), buf(n + "gamma_post"), buf("xq"), buf("xsf"),
-                 i32(chunk), var(T))
+            step(n + "norm_post", "norm_quant", buf("res"), buf(n + "gamma_post"), buf("xq"), buf("xsf"), i32(chunk),
+                 var(T))
         else:
-            step(n + "norm_post", "add_rms_quant", buf("h"), buf("res"), buf(n + "gamma_post"), buf("xn"), buf("xq"),
-                 buf("xsf"), i32(chunk), var(T))
+            step(n + "norm_post", "rms_quant", buf("res"), buf(n + "gamma_post"), buf("xn"), buf("xq"), buf("xsf"),
+                 i32(chunk), var(T))
 
         # MLP
         if l < DENSE:

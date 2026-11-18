@@ -61,11 +61,11 @@ FP8_TILE = {32: (10, 232448), 64: (7, 212992), 128: (5, 202752), 256: (3, 185344
 FP8_SWAP_TILE = {32: (11, 223232), 64: (10, 224256), 128: (8, 214016), 256: (6, 215040)}
 FP8_ENTRY = ("_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj128ELj128ELj0ELj0ELj0"
              "ELj{bm}ELj{bn}ELj128ELj{groups}ELj128ELj128ELj{swz}ELj{stages}ELj2ELj128ELj128ELj{mc}ELb{mca}ELj152ELb{swap}ELb0E"
-             "LNS_8GemmTypeE{gemm}ELb0EN7cutlass12float_e4m3_tES6_NS5_10bfloat16_tENS_8epilogue9transform"
+             "LNS_8GemmTypeE{gemm}ELb{acc}EN7cutlass12float_e4m3_tES6_NS5_10bfloat16_tENS_8epilogue9transform"
              "16EpilogueIdentityEEEvPijjjT28_14CUtensorMap_stSD_SD_SD_SD_")
 
 
-def fp8_gemm(n, k, rows, lda, ldc, sfa_rows, groups=1, bn=None, swap_bm=None, mcb=False, when=None):
+def fp8_gemm(n, k, rows, lda, ldc, sfa_rows, groups=1, bn=None, swap_bm=None, mcb=False, acc=False, when=None):
     """C[m, :n] (rows ldc apart) = A[m, :k] (lda apart) . W[n, k]^T with both operands' block scales.
     Interface: a, w, sfa, sfb, c, then m (dense) or the psum offsets of `groups` experts (grouped:
     expert g's rows end at psum[g] and start at the previous end rounded up to the block M, its weight
@@ -73,7 +73,8 @@ def fp8_gemm(n, k, rows, lda, ldc, sfa_rows, groups=1, bn=None, swap_bm=None, mc
     `swap_bm`: swap-AB with that block M (grouped: the psum alignment), BN 128, a 2-CTA cluster.
     `mcb`: BN 256 on a 2-CTA cluster along M multicasting the weight tile (source/glm_fp8_tiles.cu); the
     pair needs an even count of 128-row blocks (DeepGEMM's multicast legality), so it runs m rounded up to
-    256 rows, its extra rows inside the `rows` the maps span and read by no one."""
+    256 rows, its extra rows inside the `rows` the maps span and read by no one.
+    `acc` (swap_bm 64 or mcb): C += the product, the bf16 rounded product added by a TMA reduce-add."""
     grouped = groups > 1
     kw = k // 512
     if swap_bm:
@@ -90,9 +91,10 @@ def fp8_gemm(n, k, rows, lda, ldc, sfa_rows, groups=1, bn=None, swap_bm=None, mc
         stages, smem = FP8_TILE[bn]
         swz = min(bn * 2, 128)
         a_box, sfa_box, cd_box = [128, 128], [128, 1], [swz // 2, 128]
-    entry = FP8_ENTRY.format(bm=bm, bn=bn, groups=groups, stages=stages, mc=mc, mca=int(not mcb), swap=int(bool(swap_bm)), swz=swz,
+    entry = FP8_ENTRY.format(bm=bm, bn=bn, groups=groups, stages=stages, mc=mc, mca=int(not mcb), swap=int(bool(swap_bm)), swz=swz, acc=int(acc),
                              gemm=5 if grouped else 0)
-    params = ["in buffer<u8>", "in buffer<fp8e4m3>", "in buffer<u8>", "in buffer<u8>", "out buffer<bf16>",
+    params = ["in buffer<u8>", "in buffer<fp8e4m3>", "in buffer<u8>", "in buffer<u8>",
+              "inout buffer<bf16>" if acc else "out buffer<bf16>",
               "in buffer<i32>" if grouped else "i32"]
     maps = [desc(tm(0, 0, "u8", [k, rows], [lda], a_box, 128)),
             desc(tm(0, 1, "u8", [k, n * groups], [k], [128, bn // 2 if mcb else bn], 128)),
