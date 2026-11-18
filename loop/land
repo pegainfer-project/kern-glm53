@@ -16,13 +16,32 @@ cd "$REPO"
 [[ -z $(git status --porcelain --untracked-files=no) ]] || { echo "land: the tree is not clean" >&2; exit 1; }
 # kernels.toml's pins were the agent's main's; a conflict there takes SHA's side of each conflicting hunk only
 # (main's other entries stay), and the build repins on this main (the bench and the gate judge it)
-git cherry-pick -n "$sha" || {
-  [[ $(git diff --name-only --diff-filter=U) == kernels.toml ]] || { echo "land: conflicts beyond kernels.toml" >&2; exit 1; }
-  t=$(mktemp -d)
-  for i in 1 2 3; do git show ":$i:kernels.toml" > "$t/$i"; done
-  git merge-file --theirs "$t/2" "$t/1" "$t/3" && cp "$t/2" kernels.toml && git add kernels.toml
+# README.md's conflicts are rows both sides added to its tables: their union, read over before a batch ships
+resolve() {  # file, merge-file mode
+  local t; t=$(mktemp -d)
+  for i in 1 2 3; do git show ":$i:$1" > "$t/$i"; done
+  git merge-file "$2" "$t/2" "$t/1" "$t/3"; cp "$t/2" "$1" && git add "$1"
   rm -rf "$t"
 }
+git cherry-pick -n "$sha" || {
+  left=$(git diff --name-only --diff-filter=U | grep -vxE 'kernels.toml|README.md' || true)
+  [[ -z $left ]] || { echo "land: conflicts beyond kernels.toml and README.md: $left" >&2; exit 1; }
+  git diff --name-only --diff-filter=U | grep -qx kernels.toml && resolve kernels.toml --theirs
+  git diff --name-only --diff-filter=U | grep -qx README.md && resolve README.md --union
+  true
+}
+# an entry whose prebuilt or source the tree no longer has (an agent's base kept it, main dropped it) goes
+python3 - <<'PY'
+import pathlib, re, tomllib
+p = pathlib.Path("kernels.toml"); s = p.read_text()
+gone = [n for n, k in tomllib.loads(s)["kernels"].items()
+        if not pathlib.Path(k.get("prebuilt") or k["source"]).exists()]
+for n in gone:
+    s = re.sub(r'(?:#[^\n]*\n)*\[kernels\."' + re.escape(n) + r'"\]\n(?:[^\[#\n][^\n]*\n|\n(?=[^\[#]))*\n?', "", s)
+    print(f"land: dropped kernels.{n}, its file is gone")
+p.write_text(s)
+PY
+git add kernels.toml
 work=$GLM_LOOP_DATA/land/$sha
 mkdir -p "$work"
 "$LOOP_DIR/build" --update > "$work/build.log" 2>&1 || { tail -3 "$work/build.log"; exit 1; }
