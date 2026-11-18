@@ -341,15 +341,22 @@ extern "C" __global__ void __launch_bounds__(256) glm_q_post(
   const int r = blockIdx.x, t = threadIdx.x, w = t >> 5, l = t & 31;
   const bf16* row = qb + (size_t)r * ldb;
   const bf16* cs = rope + (size_t)pos[r] * 2 * HALF;
-  const int h = t >> 2;
 #pragma unroll
-  for (int j = 0; j < 8; ++j) {
-    const int pr = (t & 3) * 8 + j;
-    const float x1 = bf(row[h * QHD + NOPE + 2 * pr]), x2 = bf(row[h * QHD + NOPE + 2 * pr + 1]);
-    const float c = bf(cs[pr]), sn = bf(cs[HALF + pr]);
-    bf16* d = qmla + ((size_t)r * HEADS + h) * MLA + KVL + 2 * pr;
-    d[0] = __float2bfloat16(x1 * c - x2 * sn);
-    d[1] = __float2bfloat16(x2 * c + x1 * sn);
+  for (int k = 0; k < 2; ++k) {
+    const int i = t + k * 256, h = i >> 3, pr = (i & 7) * 4;
+    const uint4 u = *reinterpret_cast<const uint4*>(row + h * QHD + NOPE + 2 * pr);
+    const __nv_bfloat162* x = reinterpret_cast<const __nv_bfloat162*>(&u);
+    float c[4], sn[4];
+    ld4(cs + pr, c);
+    ld4(cs + HALF + pr, sn);
+    __nv_bfloat162 o[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float2 v = __bfloat1622float2(x[j]);
+      o[j] = __floats2bfloat162_rn(v.x * c[j] - v.y * sn[j], v.y * c[j] + v.x * sn[j]);
+    }
+    *reinterpret_cast<uint4*>(qmla + ((size_t)r * HEADS + h) * MLA + KVL + 2 * pr) =
+        *reinterpret_cast<const uint4*>(o);
   }
   if (!full) return;
 #pragma unroll

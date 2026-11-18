@@ -14,3 +14,4 @@ is that A/B's. Numerics are `loop/longcheck`'s long pass against the row above.
 | 2 | 6d7ec7c | routed GEMMs on DeepGEMM's m-grouped config: swap-AB, BN 128, 2-CTA cluster | 253.32 | 1181.50 | 289.73 | -4.34% | 436 | top-1 100.000% · flips 0 (confident 0) |
 | 3 | 868bab6 | MoE glue (silu, gather, combine) moves 16 bytes a thread, a block per row | 248.20 | 1149.30 | 283.54 | -2.13% | 436 | top-1 100.000% · flips 0 (confident 0) |
 | 4 | ae3b376 | indexer logits deal q blocks and key splits evenly over the SMs | 245.68 | 1138.05 | 280.68 | -1.01% | 516 | top-1 100.000% · flips 0 (confident 0) |
+| 5 | e6be11b | q_post ropes q_pe in 16-byte vectors | 243.34 | 1125.07 | 277.92 | -0.98% | 516 | top-1 100.000% · flips 0 (confident 0) |
