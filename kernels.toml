@@ -52,10 +52,11 @@ flags = "flashmla"
 includes = ["flashmla"]
 defines = { GLM_SMEM = 231728 }
 
-# kern-k31's indexer top-k: vLLM's top-2048 set in ascending positions, deterministic (source/k31/README.md).
-[kernels."k31_topk"]
-sha256 = "bb53876cdf32e1a41f5c4b6946c7fcb0e5d781295badb72b9271fb883d1140b3"
-source = "source/k31/k31_topk.cu"
+# The indexer's top-k over kern-k31's (source/k31/README.md): vLLM's top-2048 set in ascending positions,
+# deterministic; a long row read once against its sample's threshold (source/glm_topk.cu).
+[kernels."glm_topk"]
+sha256 = "a9187fa812d24b52a4b1c1e1df68c96b2603a8e4c5e69dd3ab760934aa681d29"
+source = "source/glm_topk.cu"
 
 [kernels."glm_glue"]
 sha256 = "5d61103542542962fac56565e19891c8975259972d93b428a734a1c87e1c0205"

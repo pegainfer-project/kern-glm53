@@ -161,7 +161,8 @@ def vup_quant(n, k, rows, a, b):
 
 # ---- the lightning indexer over one sub-chunk of R rows: DeepGEMM's metadata kernel deals the (4-row q block, 256-key
 # split) work evenly over the SMs, its fp8 MQA logits follow it (bf16, compressed: row r's logits at [r][0, ke - ks)),
-# then each row's top-k (k31_topk_held: vLLM's set, ascending, the same bytes every run; a row of at most 32k read once)
+# then each row's top-k (glm_topk: vLLM's set, ascending, the same bytes every run; a row of at most 32k read once, a
+# longer one's sample and then the row read once against a threshold)
 MQA_ENTRY = ("_ZN9deep_gemm16sm100_mqa_logitsILj32ELj128ELb0ELb1ELb0ELb1ELj4ELj256ELj3ELj5ELj152ELj128ELj256E"
              "N7cutlass12float_e4m3_tE13__nv_bfloat16S3_Lj2EEEvjjjPKjS5_S5_PT13_14CUtensorMap_stS8_S8_S8_S8_")
 META_ENTRY = "_ZN9deep_gemm5sched25sm100_mqa_logits_metadataILj4ELj256ELj152ELj1ELj1ELj15EEEvjjPKjS3_Pj"
@@ -193,7 +194,7 @@ def indexer(j, r, kv_cap):
                          *["bytes<128>"] * 5],
                  args=[{"param": 10}, {"param": 11}, {"param": 12}, {"param": 4}, {"param": 5}, {"param": 13},
                        {"param": 8}, *maps], when=when, pdl=True)
-    topk = launch("k31_topk", "k31_topk_held", [{"clamp": [T, j * r, r]}, 1, 1], [512, 1, 1], TOPK_SMEM,
+    topk = launch("glm_topk", "glm_topk", [{"clamp": [T, j * r, r]}, 1, 1], [512, 1, 1], TOPK_SMEM,
                   params=["in buffer<bf16>", "i32", "in buffer<i32>", "out buffer<i32>"],
                   args=[{"param": 8}, {"param": 12}, {"param": 7}, {"param": 9}], when=when, pdl=True)
     return {"params": ["in buffer<u8>", "in buffer<u8>", "in buffer<f32>", "in buffer<bf16>", "in buffer<u32>",

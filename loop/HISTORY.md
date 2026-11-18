@@ -28,3 +28,4 @@ is that A/B's. Numerics are `loop/longcheck`'s long pass against the row above.
 | 16 | 0d6b950 | flash_mla's li bookkeeping after so_ready, first pair barrier gone | 227.40 | 1050.26 | 259.66 | -0.35% | 553 | top-1 100.000% · flips 0 (confident 0) |
 | 17 | 4dbc60c | projections at few rows take swap-AB or narrow tiles | 226.69 | 1049.71 | 258.96 | -0.27% | 584 | top-1 100.000% · flips 0 (confident 0) |
 | 18 | d3f90b5 | from 257 rows fp8.o, q_b and the dense MLP run BN 256 on a 2-CTA cluster | 223.98 | 1035.29 | 255.79 | -1.22% | 592 | top-1 100.000% · flips 0 (confident 0) |
+| 19 | efc2414 | indexer top-k reads a long row once against its sample's threshold | 222.06 | 1023.80 | 253.49 | -0.90% | 592 | top-1 100.000% · flips 0 (confident 0) |
