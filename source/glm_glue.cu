@@ -161,19 +161,6 @@ extern "C" __global__ void __launch_bounds__(256) glm_add_rms_quant(
   }
 }
 
-// x [T, K] bf16 (rows ldx apart) quantized per 128 columns into q [T, K] and the packed scales.
-//   grid (ceil(T * K / 1024)), block 256: a warp per (row, column block)
-extern "C" __global__ void glm_quant(const bf16* __restrict__ x, int ldx, u8* __restrict__ q, u8* __restrict__ sf,
-                                     int sf_rows, int K, int T) {
-  const long long gw = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-  const int nb = K >> 7;
-  if (gw >= (long long)T * nb) return;
-  const int r = (int)(gw / nb), kb = (int)(gw % nb), c = kb * 128 + (threadIdx.x & 31) * 4;
-  float v[4];
-  ld4(x + (size_t)r * ldx + c, v);
-  quant4(v, q + (size_t)r * K + c, sf, sf_rows, r, kb, 1e-10f);
-}
-
 // act = bf16(silu(g) * u) over gate | up halves of gu [rows, 2I], quantized per 128 columns into
 // q [rows, I]. `n` (may be null) holds the live row count; rows past it are skipped.
 //   grid (ceil(rows * I / 1024)), block 256

@@ -17,3 +17,4 @@ is that A/B's. Numerics are `loop/longcheck`'s long pass against the row above.
 | 5 | e6be11b | q_post ropes q_pe in 16-byte vectors | 243.34 | 1125.07 | 277.92 | -0.98% | 516 | top-1 100.000% · flips 0 (confident 0) |
 | 6 | 7de1aa5 | bf16 indexer logits, k31_topk (f4ddc91) over bf16 rows | 240.23 | 1105.13 | 274.15 | -1.36% | 516 | top-1 91.120% · flips 23279 (confident 3) |
 | 7 | e1982ff | shared expert's GEMMs take BN 32 / 64 tiles for few rows | 239.82 | 1104.83 | 273.74 | -0.15% | 540 | top-1 100.000% · flips 0 (confident 0) |
+| 8 | 25aca61 | v up-projection writes o_proj's e4m3 input, quant_o gone | 236.63 | 1087.03 | 269.97 | -1.38% | 529 | top-1 100.000% · flips 0 (confident 0) |

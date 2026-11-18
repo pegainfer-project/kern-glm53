@@ -16,7 +16,7 @@ A layer, as vLLM runs GLM-5 (DeepSeek V3.2's sparse attention) on Blackwell with
   - [q_b | wq_b] in one fp8 GEMM, W_UK absorbed per head (bf16 batched GEMM), q_pe rope;
   - on an indexer layer (`full`), the indexer's fp8 MQA logits over every key of the row's
     sequence and the top 2048 of them; a `shared` layer reuses the last indexer layer's picks;
-  - FlashMLA's sparse prefill over the picked latent rows, W_UV per head, o_proj (fp8). With --kv fp8
+  - FlashMLA's sparse prefill over the picked latent rows, W_UV per head landing o_proj's e4m3 input, o_proj (fp8). With --kv fp8
     (the default) the latent cache is SGLang's fp8 DSA row (656 bytes: 512 e4m3 in tiles of 128 with
     f32 scales, 64 bf16 rope), lifted to bf16 sequence after sequence before the attention as SGLang
     does for a prefix (dequantize_k_cache_paged); --kv bf16 keeps [576] bf16 rows and attends in place;
@@ -121,9 +121,6 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
                       "impl": {"launches": [{"entry": "extern:cublaslt_bf16_tn"}]}},
         "gemm_f32": {"params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32", "i32"],
                      "impl": {"launches": [{"entry": "extern:cublas_bf16_tn_f32"}]}},
-        "quant_o": G.plain("glm_glue", "glm_quant",
-                           ["in buffer<bf16>", "i32", "out buffer<u8>", "out buffer<u8>", "i32", "i32", "i32"],
-                           [{"mul": [T, HEADS * VD // 1024]}, 1, 1], [256, 1, 1]),
         "silu_dense": G.nulled("glm_glue", "glm_silu_mul_quant",
                                ["in buffer<bf16>", "i32", "out buffer<u8>", "out buffer<u8>", "i32", "in buffer<i32>",
                                 "i32"], {5}, [{"mul": [T, DENSE_I // 1024]}, 1, 1], [256, 1, 1]),
@@ -153,8 +150,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
                               [{"add": [{"ceil_div": [CTX, PAGE]}, S]}, 1, 1], [256, 1, 1]),
         "uk": G.bf16_batched(KVL, NOPE, chunk, (NB[True] * 2, (NOPE + ROPE) * 2), (NOPE * 2, KVL * NOPE * 2),
                              (HEADS * MLA * 2, MLA * 2)),
-        "uv": G.bf16_batched(VD, KVL, chunk, (HEADS * KVL * 2, KVL * 2), (KVL * 2, (NOPE + VD) * KVL * 2),
-                             (HEADS * VD * 2, VD * 2)),
+        "uv": G.vup_quant(VD, KVL, chunk, (HEADS * KVL * 2, KVL * 2), (KVL * 2, (NOPE + VD) * KVL * 2)),
         "flash_mla": G.flash_mla(chunk, mla_entry(), "in buffer<bf16>" if fp8kv else "in state"),
         "router_topk": {"params": ["in buffer<f32>", "in buffer<f32>", "in buffer<bf16>", "out buffer<i32>",
                                    "out buffer<f32>", "i32"],
@@ -288,7 +284,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
     once.call("fill_bf16", [buf("rs"), i32(1), {"f32": 2.5}], 1)
 
     for name, w in (("res", H), ("h", H), ("xn", H), ("qa", NA[True]), ("qb", NB[True]), ("qmla", HEADS * MLA),
-                    ("o", HEADS * KVL), ("ov", HEADS * VD), ("sg", 2 * INTER), ("sh", H), ("dg", 2 * DENSE_I)):
+                    ("o", HEADS * KVL), ("sg", 2 * INTER), ("sh", H), ("dg", 2 * DENSE_I)):
         work(name, [T, w])
     for name, w in (("xq", H), ("qq", QL), ("iq", IQB), ("oq", HEADS * VD), ("sq", INTER), ("dq", DENSE_I)):
         work(name, [T, w], "u8")
@@ -427,9 +423,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
                  buf("kvd"))
         step(n + "attn", "flash_mla", buf("qmla"), buf("qmla", KVL * 2), buf("kvd") if fp8kv else kv, buf("ind"),
              buf("tlen"), buf("o"), buf("ml"), buf("lse"))
-        step(n + "uv", "uv", buf("o"), buf(n + "kvb", NOPE * KVL * 2), buf("ov"), var(T))
-        step(n + "quant_o", "quant_o", buf("ov"), i32(HEADS * VD), buf("oq"), buf("osf"), i32(chunk), i32(HEADS * VD),
-             var(T))
+        step(n + "uv", "uv", buf("o"), buf(n + "kvb", NOPE * KVL * 2), buf("oq"), buf("osf"), var(T))
         gemm(n + "o", "o", "oq", n + "w_o", "h", a_sf="osf")
         step(n + "norm_post", "add_rms_quant", buf("h"), buf("res"), buf(n + "gamma_post"), buf("xn"), buf("xq"),
              buf("xsf"), i32(chunk), var(T))

@@ -36,6 +36,14 @@ source = "source/glm_deepgemm.cu"
 flags = "deepgemm"
 includes = ["deepgemm"]
 
+# DeepGEMM's sm100 bf16 batched GEMM, unmodified, with an epilogue of ours: MLA's v up-projection landing
+# o_proj's e4m3 input and its UE8M0 scales (source/glm_vup.cu).
+[kernels."glm_vup"]
+sha256 = "87d5672bf3e010ae11bdeaf141df4d0f1720bde5b75306be3dc93d9e1187b439"
+source = "source/glm_vup.cu"
+flags = "deepgemm"
+includes = ["deepgemm"]
+
 # FlashMLA sm100 sparse prefill, head 64, d_qk 576. Unmodified upstream instantiation.
 [kernels."glm_flashmla"]
 sha256 = "7f19c223c47d3cf50e2fae42f2edca5f4adbbc155894a600f279fbf3548036f2"
@@ -49,7 +57,7 @@ sha256 = "bb53876cdf32e1a41f5c4b6946c7fcb0e5d781295badb72b9271fb883d1140b3"
 source = "source/k31/k31_topk.cu"
 
 [kernels."glm_glue"]
-sha256 = "a7f5b77c6e7f69227b8ae60f91e54796f4633df632e4678d1caee0e9becdb776"
+sha256 = "8ba1b1f9251cbe66fc213f317cf1a826165fe01169f78d09c796591c641d6c93"
 source = "source/glm_glue.cu"
 
 [kernels."glm_prep"]

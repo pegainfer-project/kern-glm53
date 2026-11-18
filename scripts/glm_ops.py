@@ -118,6 +118,26 @@ def bf16_batched(n, k, rows, a, b, d, bn=256):
                 args=[{"i64": 0}, {"param": 3}, {"i32": n}, {"i32": k}, EPILOGUE, *maps], pdl=True)]}}
 
 
+VUP_ENTRY = BF16_ENTRY.format(bn=256, stages=4).replace(
+    "9transform16EpilogueIdentityELm100EEEvPijjjT23_14CUtensorMap_stSC_SC_", "9GlmQuantOELm100EEEvPijjjT23_14CUtensorMap_stSB_SB_")
+
+
+def vup_quant(n, k, rows, a, b):
+    """bf16_batched's v up-projection, D landing as e4m3 [b][h][n] with o_proj's packed UE8M0 scales of each
+    128 columns ([h * n / 512][rows] words). Interface: a, b, q, sf, m."""
+    stages, smem = BF16_TILE[256]
+    maps = [desc(tm(0, 0, "bf16", [k, rows, 64], list(a), [64, 128, 1], 128)),
+            desc(tm(0, 1, "bf16", [k, n, 64], list(b), [64, 256, 1], 128)),
+            desc(tm(0, 2, "u8", [n, rows, 64], [64 * n, n], [128, 128, 1], 128))]
+    epi = {"pack": {"size": 24, "fields": [{"at": 0, "param": 3}, {"at": 8, "i32": rows}, {"at": 12, "var": T},
+                                           {"at": 16, "i32": n}, {"at": 20, "f32": 1.0}]}}
+    return {"params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<u8>", "out buffer<u8>", "i32"],
+            "impl": {"launches": [launch(
+                "glm_vup", VUP_ENTRY, [SMS, 1, 1], [256, 1, 1], smem,
+                params=["i64", "i32", "i32", "i32", "bytes<24>", *["bytes<128>"] * 3],
+                args=[{"i64": 0}, {"param": 4}, {"i32": n}, {"i32": k}, epi, *maps], pdl=True)]}}
+
+
 # ---- the lightning indexer over one sub-chunk of R rows: DeepGEMM's metadata kernel deals the (4-row q block, 256-key
 # split) work evenly over the SMs, its fp8 MQA logits follow it (bf16, compressed: row r's logits at [r][0, ke - ks)),
 # then each row's top-k (k31_topk_held: vLLM's set, ascending, the same bytes every run; a row of at most 32k read once)
