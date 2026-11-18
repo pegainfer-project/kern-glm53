@@ -31,7 +31,7 @@ flashmla = ["third_party/FlashMLA/csrc", "third_party/FlashMLA/csrc/kerutils/inc
 # DeepGEMM sm100: the fp8 GEMMs (dense and the MoE's psum-grouped), the bf16 batched absorb / v-up,
 # the indexer's fp8 MQA logits. Unmodified upstream templates.
 [kernels."glm_deepgemm"]
-sha256 = "6ed546fd973f1afe688601324801739e6cb91b0bb3557d00503c1f2b5844404b"
+sha256 = "d6430b8983b80c445b011755751ade22097283035db3abfacc21927791445253"
 source = "source/glm_deepgemm.cu"
 flags = "deepgemm"
 includes = ["deepgemm"]
@@ -49,7 +49,7 @@ sha256 = "104783b90d14f6b268a614dd9497743c027c57a0071762c7b9f39778ddba19ad"
 source = "source/k31/k31_topk.cu"
 
 [kernels."glm_glue"]
-sha256 = "62cbefd6a5efcaf2ad78268f4927ab74edb1524defff1d555213c38f0a0e9bdf"
+sha256 = "4571321123fd71eadba114c361398a41afdc07ac063f7bf38362d34b27b65d73"
 source = "source/glm_glue.cu"
 
 [kernels."glm_prep"]

@@ -462,13 +462,13 @@ extern "C" __global__ void glm_topk_slots(int* __restrict__ ind, const int* __re
   if (threadIdx.x == 0) tlen[r] = min(klen[r], TOPK);
 }
 
-// The expert offsets the grouped GEMM's psum layout reads: expert e's rows start at its 128-aligned
+// The expert offsets the grouped GEMM's psum layout reads: expert e's rows start at its `tile`-aligned
 // CTA offset (FlashInfer's routing tables) and end count[e] rows later.
 //   grid (1), block 256
-extern "C" __global__ void glm_moe_psum(const int* __restrict__ counts, int* __restrict__ psum) {
+extern "C" __global__ void glm_moe_psum(const int* __restrict__ counts, int* __restrict__ psum, int tile) {
   __shared__ int sm[256];
-  const int e = threadIdx.x, c = counts[e];
-  sm[e] = (c + 127) >> 7;
+  const int e = threadIdx.x, c = counts[e], b = (c + tile - 1) / tile;
+  sm[e] = b;
   __syncthreads();
   for (int o = 1; o < 256; o <<= 1) {
     const int v = e >= o ? sm[e - o] : 0;
@@ -476,7 +476,7 @@ extern "C" __global__ void glm_moe_psum(const int* __restrict__ counts, int* __r
     sm[e] += v;
     __syncthreads();
   }
-  psum[e] = (sm[e] - ((c + 127) >> 7)) * 128 + c;
+  psum[e] = (sm[e] - b) * tile + c;
 }
 
 // Expanded row (t, k) of the routed activation: token t's e4m3 row and its scale words at permuted

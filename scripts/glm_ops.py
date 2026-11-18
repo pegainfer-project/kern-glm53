@@ -48,34 +48,53 @@ def nulled(mod, entry, params, null, grid, block):
 
 # ---- DeepGEMM sm100 fp8 1d1d: e4m3 x e4m3 -> bf16, UE8M0 scales packed four to an i32 (MN-major)
 FP8_TILE = {128: (5, 202752), 256: (3, 185344)}  # BN -> (stages, shared memory)
+# grouped swap-AB, BN 128 over a 2-CTA cluster: BM -> (stages, shared memory) (source/glm_deepgemm.cu)
+FP8_SWAP_TILE = {32: (11, 223232), 64: (10, 224256), 128: (8, 214016), 256: (6, 215040)}
 FP8_ENTRY = ("_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj128ELj128ELj0ELj0ELj0"
-             "ELj128ELj{bn}ELj128ELj{groups}ELj128ELj128ELj128ELj{stages}ELj2ELj128ELj128ELj1ELb1ELj152ELb0ELb0E"
+             "ELj{bm}ELj{bn}ELj128ELj{groups}ELj128ELj128ELj{swz}ELj{stages}ELj2ELj128ELj128ELj{mc}ELb1ELj152ELb{swap}ELb0E"
              "LNS_8GemmTypeE{gemm}ELb0EN7cutlass12float_e4m3_tES6_NS5_10bfloat16_tENS_8epilogue9transform"
              "16EpilogueIdentityEEEvPijjjT28_14CUtensorMap_stSD_SD_SD_SD_")
 
 
-def fp8_gemm(n, k, rows, lda, ldc, sfa_rows, groups=1, bn=None):
+def fp8_gemm(n, k, rows, lda, ldc, sfa_rows, groups=1, bn=None, swap_bm=None, when=None):
     """C[m, :n] (rows ldc apart) = A[m, :k] (lda apart) . W[n, k]^T with both operands' block scales.
     Interface: a, w, sfa, sfb, c, then m (dense) or the psum offsets of `groups` experts (grouped:
-    expert g's rows end at psum[g] and start at the previous end rounded up to 128, its weight rows
-    at g * n, its scale words at g * k / 512). The tensor maps span `rows` rows of A and C."""
-    bn = bn or (256 if n >= 4096 and n % 256 == 0 else 128)
-    stages, smem = FP8_TILE[bn]
+    expert g's rows end at psum[g] and start at the previous end rounded up to the block M, its weight
+    rows at g * n, its scale words at g * k / 512). The tensor maps span `rows` rows of A and C.
+    `swap_bm` (grouped): swap-AB with that block M (the psum alignment), BN 128, a 2-CTA cluster."""
     grouped = groups > 1
     kw = k // 512
-    entry = FP8_ENTRY.format(bn=bn, groups=groups, stages=stages, gemm=5 if grouped else 0)
+    if swap_bm:
+        bm, bn, mc = swap_bm, 128, 2
+        stages, smem = FP8_SWAP_TILE[bm]
+        a_box, sfa_box, swz, cd_box = [128, bm // mc], [-(-bm // 128) * 128, 1], 128, [64, 16]
+    else:
+        bm, mc = 128, 1
+        bn = bn or (256 if n >= 4096 and n % 256 == 0 else 128)
+        stages, smem = FP8_TILE[bn]
+        swz = min(bn * 2, 128)
+        a_box, sfa_box, cd_box = [128, 128], [128, 1], [swz // 2, 128]
+    entry = FP8_ENTRY.format(bm=bm, bn=bn, groups=groups, stages=stages, mc=mc, swap=int(bool(swap_bm)), swz=swz,
+                             gemm=5 if grouped else 0)
     params = ["in buffer<u8>", "in buffer<fp8e4m3>", "in buffer<u8>", "in buffer<u8>", "out buffer<bf16>",
               "in buffer<i32>" if grouped else "i32"]
-    maps = [desc(tm(0, 0, "u8", [k, rows], [lda], [128, 128], 128)),
+    maps = [desc(tm(0, 0, "u8", [k, rows], [lda], a_box, 128)),
             desc(tm(0, 1, "u8", [k, n * groups], [k], [128, bn], 128)),
-            desc(tm(0, 2, "i32", [sfa_rows, kw], [sfa_rows * 4], [128, 1])),
-            desc(tm(0, 3, "i32", [n, kw * groups], [n * 4], [bn, 1])),
-            desc(tm(0, 4, "bf16", [n, rows], [ldc * 2], [64, 128], 128))]
+            desc(tm(0, 2, "i32", [sfa_rows, kw], [sfa_rows * 4], sfa_box)),
+            desc(tm(0, 3, "i32", [n, kw * groups], [n * 4], [max(bn, 128), 1])),
+            desc(tm(0, 4, "bf16", [n, rows], [ldc * 2], cd_box, swz))]
     head = [{"param": 5}, {"i32": rows}] if grouped else [{"i64": 0}, {"param": 5}]
     kparams = ["in buffer<i32>" if grouped else "i64", "i32", "i32", "i32", "bytes<24>", *["bytes<128>"] * 5]
-    return {"params": params, "impl": {"launches": [launch(
-        "glm_deepgemm", entry, [SMS, 1, 1], [256, 1, 1], smem, params=kparams,
-        args=[*head, {"i32": n}, {"i32": k}, EPILOGUE, *maps], pdl=True)]}}
+    extra = {"cluster": [mc, 1, 1]} if mc > 1 else {}
+    if when:
+        extra["when"] = when
+    return launch("glm_deepgemm", entry, [SMS, 1, 1], [256, 1, 1], smem, params=kparams,
+                  args=[*head, {"i32": n}, {"i32": k}, EPILOGUE, *maps], pdl=True, **extra), params
+
+
+def fp8_op(*a, **kw):
+    l, params = fp8_gemm(*a, **kw)
+    return {"params": params, "impl": {"launches": [l]}}
 
 
 # ---- DeepGEMM sm100 bf16, batched over the 64 heads: D[h][b][d] = A[h][b][:k] . B[h][d][:k]
@@ -203,30 +222,35 @@ def counts_len(experts):
     return max(512, 2 * experts)
 
 
-def routing(experts, topk, tile):
+def routing(experts, topk, tiles):
     """Interface: ids i32 [tokens, topk], counts [counts_len], cta_batch, cta_limit, num_non_exiting,
     total_padded, route_map, exp2perm [tokens, topk]. After it, counts[e] is expert e's row count and
-    expanded row (t, k) sits at exp2perm[t * topk + k]: expert e's rows from 128 * its CTA offset."""
+    expanded row (t, k) sits at exp2perm[t * topk + k]: expert e's rows from `tile` * its CTA offset.
+    `tiles`: [(when, tile)], the padding of each row-count range."""
     P = {n: i for i, n in enumerate(["ids", "counts", "cta_batch", "cta_limit", "num_non_exiting", "total_padded",
                                      "route_map", "exp2perm"])}
     ptr = lambda f, p: {"at": ROUTING_OFF[f], "param": P[p]}
     i32 = lambda f, v: {"at": ROUTING_OFF[f], "i32": v}
-    fields = [
-        {"at": ROUTING_OFF["mIsPow2"], "u8": 1},
-        ptr("mPtrExpertCounts", "counts"), ptr("mPtrPermutedIdxSize", "total_padded"),
-        ptr("mPtrExpandedIdxToPermutedIdx", "exp2perm"), ptr("mPtrPermutedIdxToTokenIdx", "route_map"),
-        ptr("mPtrCtaIdxXyToBatchIdx", "cta_batch"), ptr("mPtrCtaIdxXyToMnLimit", "cta_limit"),
-        ptr("mPtrNumNonExitingCtas", "num_non_exiting"), ptr("mPtrTopKIds", "ids"),
-        {"at": ROUTING_OFF["mNumTokens"], "var": T}, i32("mNumExperts", experts),
-        i32("mPaddingLog2", tile.bit_length() - 1), i32("mTileTokensDim", tile), i32("mLocalExpertsStartIdx", 0),
-        i32("mNumLocalExperts", experts),
-        *({"at": ROUTING_OFF["mTopK"] + 4 * j, "i32": w} for j, w in enumerate(fast_div(topk))),
-    ]
-    pack = {"pack": {"size": 192, "fields": sorted(fields, key=lambda f: f["at"])}}
+
+    def pack(tile):
+        fields = [
+            {"at": ROUTING_OFF["mIsPow2"], "u8": 1},
+            ptr("mPtrExpertCounts", "counts"), ptr("mPtrPermutedIdxSize", "total_padded"),
+            ptr("mPtrExpandedIdxToPermutedIdx", "exp2perm"), ptr("mPtrPermutedIdxToTokenIdx", "route_map"),
+            ptr("mPtrCtaIdxXyToBatchIdx", "cta_batch"), ptr("mPtrCtaIdxXyToMnLimit", "cta_limit"),
+            ptr("mPtrNumNonExitingCtas", "num_non_exiting"), ptr("mPtrTopKIds", "ids"),
+            {"at": ROUTING_OFF["mNumTokens"], "var": T}, i32("mNumExperts", experts),
+            i32("mPaddingLog2", tile.bit_length() - 1), i32("mTileTokensDim", tile), i32("mLocalExpertsStartIdx", 0),
+            i32("mNumLocalExperts", experts),
+            *({"at": ROUTING_OFF["mTopK"] + 4 * j, "i32": w} for j, w in enumerate(fast_div(topk))),
+        ]
+        return {"pack": {"size": 192, "fields": sorted(fields, key=lambda f: f["at"])}}
+
     expanded = {"ceil_div": [{"mul": [T, topk]}, 8 * ROUTING_THREADS]}
-    l = lambda kind, grid: launch("flashinfer_moe_routing", ROUTING_T.format(kind), [grid, 1, 1],
-                                  [ROUTING_THREADS, 1, 1], params=["bytes<192>"], args=[pack])
+    l = lambda kind, grid, when, tile: launch(
+        "flashinfer_moe_routing", ROUTING_T.format(kind), [grid, 1, 1], [ROUTING_THREADS, 1, 1], params=["bytes<192>"],
+        args=[pack(tile)], **({"when": when} if len(tiles) > 1 else {}))
     return {"params": ["in buffer<i32>", *["out buffer<i32>"] * 7],
-            "impl": {"launches": [l("23routingInitExpertCounts", -(-counts_len(experts) // ROUTING_THREADS)),
-                                  l("29routingIndicesHistogramKernel", expanded),
-                                  l("27routingIndicesOffsetsKernel", expanded)]}}
+            "impl": {"launches": [l(k, g, w, t) for w, t in tiles for k, g in (
+                ("23routingInitExpertCounts", -(-counts_len(experts) // ROUTING_THREADS)),
+                ("29routingIndicesHistogramKernel", expanded), ("27routingIndicesOffsetsKernel", expanded))]}}

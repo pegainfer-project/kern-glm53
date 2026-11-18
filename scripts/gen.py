@@ -80,11 +80,30 @@ def mla_entry():
     return entry
 
 
-def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0):
+# the routed GEMMs' layout by row count (DeepGEMM's m-grouped choice: swap-AB, BN 128, a 2-CTA cluster)
+MOE_TILES = "16384:s128"
+
+
+def moe_layouts(spec, chunk):
+    """`--moe-tiles` as [(when, block M or None)]: "512:s32,16384:n" runs swap-AB block M 32 up to 512 rows, then
+    the plain BN-by-128 tile (block M 128) up to 16384."""
+    out, lo = [], 1
+    for part in spec.split(","):
+        hi, cfg = part.split(":")
+        hi = min(int(hi), chunk)
+        out.append(({"var": T, "min": lo, "max": hi}, int(cfg[1:]) if cfg[1:] else None))
+        lo = hi + 1
+    assert lo > chunk, "the MoE layouts cover every row count"
+    return out
+
+
+def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_tiles=MOE_TILES):
     assert chunk % sub == 0 and chunk % 128 == 0 and max_ctx % 256 == 0
     max_pages = max_ctx // PAGE
-    mcap = TOPK * chunk + EXPERTS * 128          # routed rows, each expert's padded to 128
-    ctas = mcap // 128
+    layouts = moe_layouts(moe_tiles, chunk)
+    tiles = [bm or 128 for _, bm in layouts]
+    mcap = TOPK * chunk + EXPERTS * max(tiles)   # routed rows, each expert's padded to its block M
+    ctas = mcap // min(tiles)
     kv0 = f"kv.{first}"
     head = first == 0 or layers == LAYERS
     fp8kv = kv_dtype == "fp8"
@@ -141,8 +160,10 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0):
                         "impl": {"launches": [{**module("k3_router_argmax", EXPERTS=EXPERTS, TOPK=TOPK),
                                                "entry": "kern_k3_router_topk", "grid": [T, 1, 1],
                                                "block": [256, 1, 1]}]}},
-        "routing": G.routing(EXPERTS, TOPK, 128),
-        "moe_psum": G.plain("glm_glue", "glm_moe_psum", ["in buffer<i32>", "out buffer<i32>"], [1, 1, 1], [256, 1, 1]),
+        "routing": G.routing(EXPERTS, TOPK, [(w, bm or 128) for w, bm in layouts]),
+        "moe_psum": {"params": ["in buffer<i32>", "out buffer<i32>"], "impl": {"launches": [
+            G.launch("glm_glue", "glm_moe_psum", [1, 1, 1], [256, 1, 1], params=["in buffer<i32>", "out buffer<i32>", "i32"],
+                     args=[{"param": 0}, {"param": 1}, {"i32": bm or 128}], when=w) for w, bm in layouts]}},
         "moe_gather": G.plain("glm_glue", "glm_moe_gather",
                               ["in buffer<u8>", "in buffer<u8>", "i32", "in buffer<i32>", "out buffer<u8>",
                                "out buffer<u8>", "i32"], [{"mul": [T, TOPK]}, 1, 1], [256, 1, 1]),
@@ -190,7 +211,11 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0):
         "moe.dn": (H, INTER, mcap, INTER, H, mcap, EXPERTS),
     }
     for k, a in gemms.items():
-        ops["fp8." + k] = G.fp8_gemm(*a)
+        if k.startswith("moe."):
+            ls = [G.fp8_gemm(*a, swap_bm=bm, when=w) for w, bm in layouts]
+            ops["fp8." + k] = {"params": ls[0][1], "impl": {"launches": [l for l, _ in ls]}}
+        else:
+            ops["fp8." + k] = G.fp8_op(*a)
 
     requant_params = ["in buffer<fp8e4m3>", "in buffer<f32>", "out buffer<fp8e4m3>", "out buffer<u8>", "i32", "i32",
                       "i32", "i32", "i32", "i32", "i64"]
@@ -484,10 +509,12 @@ def main():
     ap.add_argument("--first", type=int, default=0,
                     help="first layer, fed the token embedding (a stage's stand-in for kern bench, which feeds a cut "
                          "stage's crossing h / res as it finds them)")
+    ap.add_argument("--moe-tiles", default=MOE_TILES,
+                    help="the routed GEMMs' layout by row count: MAX:s<block M> (swap-AB) or MAX:n (plain), comma-separated")
     a = ap.parse_args()
     cuts = {int(c) for c in a.cuts.split(",") if c}
     assert cuts <= FULL, "a stage starts at an indexer layer: the picks never cross a cut"
-    json.dump(build(a.layers, a.chunk, a.pack, a.max_ctx, a.sub, cuts, a.kv, a.first), sys.stdout, indent=1)
+    json.dump(build(a.layers, a.chunk, a.pack, a.max_ctx, a.sub, cuts, a.kv, a.first, a.moe_tiles), sys.stdout, indent=1)
     print()
 
 

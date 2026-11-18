@@ -11,3 +11,4 @@ is that A/B's. Numerics are `loop/longcheck`'s long pass against the row above.
 |---|---|---|---|---|---|---|---|---|
 | 0 | 8374b60 | baseline: deterministic top-k (k31_topk), reproducible builds | 271.59 | 1229.57 | 309.17 | — | 436 | 78 layers vs SGLang fp8 KV: top-1 95.22%, 10 confident |
 | 1 | 619e0d1 | silu_moe over the routed rows only, not the padding | 265.30 | 1222.78 | 302.86 | -2.04% | 436 | top-1 100.000% · flips 0 (confident 0) |
+| 2 | 6d7ec7c | routed GEMMs on DeepGEMM's m-grouped config: swap-AB, BN 128, 2-CTA cluster | 253.32 | 1181.50 | 289.73 | -4.34% | 436 | top-1 100.000% · flips 0 (confident 0) |
