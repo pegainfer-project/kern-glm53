@@ -31,21 +31,21 @@ flashmla = ["third_party/FlashMLA/csrc", "third_party/FlashMLA/csrc/kerutils/inc
 # DeepGEMM sm100: the fp8 GEMMs (dense and the MoE's psum-grouped), the bf16 batched absorb / v-up,
 # the indexer's fp8 MQA logits. Unmodified upstream templates.
 [kernels."glm_deepgemm"]
-sha256 = "0847c7d5018b5c0e01e5849e56c66405847f5756e1e8924cd049be2f96b06f8e"
+sha256 = "6ed546fd973f1afe688601324801739e6cb91b0bb3557d00503c1f2b5844404b"
 source = "source/glm_deepgemm.cu"
 flags = "deepgemm"
 includes = ["deepgemm"]
 
 # FlashMLA sm100 sparse prefill, head 64, d_qk 576. Unmodified upstream instantiation.
 [kernels."glm_flashmla"]
-sha256 = "14417771a0ab8a63895a78f73a3962f4394b92bd5735e148791affa1f6d9f9c0"
+sha256 = "cd8e89c8e9c803479ae3894d4bb05f16a0f52fae2e6be532586a2f797e43d89c"
 source = "source/glm_flashmla.cu"
 flags = "flashmla"
 includes = ["flashmla"]
 
 # vLLM's prefill top-k (source/vllm-topk/PROVENANCE.md).
 [kernels."vllm_topk"]
-sha256 = "2052d0cadf13ebcb1cef5c678a069f128a1e21ecc4696c2349909ff3e543a80a"
+sha256 = "93c8e8c6d5e51e8a06404689e33aac914b83d68a4fa4c5f241140411a712c327"
 source = "source/vllm-topk/topk.cu"
 
 [kernels."glm_glue"]
