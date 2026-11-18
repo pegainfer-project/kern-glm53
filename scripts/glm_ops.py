@@ -291,9 +291,10 @@ def flash_mla(rows, entry, kv):
 # ---- the routing tables (source/glm_moe.cu): a tally of each slice of ROUTE_SLICE tokens, then the experts'
 # offsets and every routed row's place
 ROUTE_SLICE = 256
+SCATTER_ROWS = 4096  # up to it glm_moe_scatter writes the row table and scales; past it glm_moe_place does
 
 
-def moe_route(experts, tiles, x_rows, a_rows):
+def moe_route(experts, tiles, x_rows, a_rows, sf_words):
     """Interface: ids i32 [tokens, 8], hist i32 [slices, experts] (scratch), psum i32 [experts + 1] out, exp2perm
     i32 [tokens, 8] out, tokens, rows i32 [a_rows] out, xsf (the tokens' packed scales, `x_rows` a word row) in,
     asf (the grouped rows', `a_rows` a word row) out. Group 0, the shared expert, is rows [0, tokens) (psum[0]),
@@ -303,12 +304,21 @@ def moe_route(experts, tiles, x_rows, a_rows):
     grid = [{"ceil_div": [T, ROUTE_SLICE]}, 1, 1]
     count = launch("glm_moe", "glm_moe_count", grid, [ROUTE_SLICE, 1, 1],
                    params=["in buffer<i32>", "i32", "out buffer<i32>"], args=[{"param": 0}, {"param": 4}, {"param": 1}])
+    writes = [bool(w) and w.get("min", 1) > SCATTER_ROWS for w, _ in tiles]
+    tables = lambda own: [{"param": 5}, {"param": 6}, {"i32": x_rows}, {"param": 7}, {"i32": a_rows}] if own else \
+        [{"i64": 0}, {"i64": 0}, {"i32": x_rows}, {"i64": 0}, {"i32": a_rows}]
     place = [launch("glm_moe", "glm_moe_place", grid, [ROUTE_SLICE, 1, 1],
                     params=["in buffer<i32>", "i32", "in buffer<i32>", "i32", "out buffer<i32>", "out buffer<i32>",
-                            "out buffer<i32>", "in buffer<u8>", "i32", "out buffer<u8>", "i32"],
+                            *(["out buffer<i32>", "in buffer<u8>", "i32", "out buffer<u8>", "i32"] if own else
+                              ["i64", "i64", "i32", "i64", "i32"])],
                     args=[{"param": 0}, {"param": 4}, {"param": 1}, {"i32": tile}, {"param": 2}, {"param": 3},
-                          {"param": 5}, {"param": 6}, {"i32": x_rows}, {"param": 7}, {"i32": a_rows}],
-                    **({"when": w} if len(tiles) > 1 else {})) for w, tile in tiles]
+                          *tables(own)],
+                    **({"when": w} if len(tiles) > 1 else {})) for (w, tile), own in zip(tiles, writes)]
+    scatter = launch("glm_moe", "glm_moe_scatter", [{"ceil_div": [T, 256]}, sf_words + 1, 1], [256, 1, 1],
+                     params=["in buffer<i32>", "i32", "out buffer<i32>", "in buffer<u8>", "i32", "out buffer<u8>", "i32"],
+                     args=[{"param": 3}, {"param": 4}, {"param": 5}, {"param": 6}, {"i32": x_rows}, {"param": 7},
+                           {"i32": a_rows}],
+                     **({"when": {"var": T, "min": 1, "max": SCATTER_ROWS}} if any(writes) else {}))
     return {"params": ["in buffer<i32>", "out buffer<i32>", "out buffer<i32>", "out buffer<i32>", "i32",
                        "out buffer<i32>", "in buffer<u8>", "out buffer<u8>"],
-            "impl": {"launches": [count, *place]}}
+            "impl": {"launches": [count, *place, scatter]}}

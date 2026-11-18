@@ -162,7 +162,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
                         "impl": {"launches": [{**module("k3_router_argmax", EXPERTS=EXPERTS, TOPK=TOPK),
                                                "entry": "kern_k3_router_topk", "grid": [T, 1, 1],
                                                "block": [256, 1, 1]}]}},
-        "moe_route": G.moe_route(EXPERTS, [(w, bm or 128) for w, bm in layouts], chunk, mcap),
+        "moe_route": G.moe_route(EXPERTS, [(w, bm or 128) for w, bm in layouts], chunk, mcap, H // 512),
         "moe_combine": G.plain("glm_glue", "glm_moe_combine",
                                ["in buffer<bf16>", "in buffer<i32>", "in buffer<f32>", "in buffer<bf16>",
                                 "out buffer<bf16>", "i32"], [T, 1, 1], [256, 1, 1]),

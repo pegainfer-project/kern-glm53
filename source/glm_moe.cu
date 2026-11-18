@@ -1,9 +1,10 @@
-// GLM-5.3's routing tables for the MoE's grouped GEMMs' psum layout, from the router's top-8 ids, in two
+// GLM-5.3's routing tables for the MoE's grouped GEMMs' psum layout, from the router's top-8 ids, in three
 // launches: glm_moe_count tallies each slice of SLICE tokens' rows per expert, glm_moe_place lays the groups
 // out, the shared expert's T rows first (psum[0] = T), routed expert e's from its `tile`-aligned offset past
 // them (psum[e + 1] its end), and puts row (t, k) at p = exp2perm[t * 8 + k], an expert's rows in token
-// order: rows[p] = t, the token the gate-up GEMM gathers, and its activation's scale words at p (the shared
-// expert's row t is token t). Every count is a popcount of a token bitmap: the same tables every run.
+// order; glm_moe_scatter writes rows[p] = t, the token the gate-up GEMM gathers, and its activation's scale
+// words at p (the shared expert's row t is token t), or past 4096 rows glm_moe_place itself. Every count is
+// a popcount of a token bitmap: the same tables every run.
 #include <stdint.h>
 
 #define EXPERTS 256
@@ -43,6 +44,7 @@ extern "C" __global__ void __launch_bounds__(SLICE) glm_moe_count(const int* __r
   hist[blockIdx.x * EXPERTS + threadIdx.x] = popc_masks(mask[threadIdx.x]);
 }
 
+// With rows_out, also glm_moe_scatter's writes, a token a thread (where a few CTAs keep up with them).
 //   grid (ceil(T / SLICE)), block SLICE; xsf [SF_WORDS][x_rows] words, asf [SF_WORDS][a_rows]
 extern "C" __global__ void __launch_bounds__(SLICE) glm_moe_place(const int* __restrict__ ids, int T,
                                                                    const int* __restrict__ hist, int tile,
@@ -94,6 +96,7 @@ extern "C" __global__ void __launch_bounds__(SLICE) glm_moe_place(const int* __r
   int4* q = reinterpret_cast<int4*>(exp2perm + (size_t)t * TOPK);
   q[0] = make_int4(out[0], out[1], out[2], out[3]);
   q[1] = make_int4(out[4], out[5], out[6], out[7]);
+  if (rows_out == nullptr) return;
   unsigned w[SF_WORDS];
 #pragma unroll
   for (int j = 0; j < SF_WORDS; ++j) w[j] = xsf[(size_t)j * x_rows + t];
@@ -106,4 +109,26 @@ extern "C" __global__ void __launch_bounds__(SLICE) glm_moe_place(const int* __r
 #pragma unroll
     for (int j = 0; j < SF_WORDS; ++j) asf[(size_t)j * a_rows + out[k]] = w[j];
   }
+}
+
+// Token t's grouped rows (the shared expert's t, its routed exp2perm[t * 8 + k]): word y of its scales at each
+// of them (y < SF_WORDS), or (y = SF_WORDS) t in the row table.
+//   grid (ceil(T / 256), SF_WORDS + 1), block 256; xsf [SF_WORDS][x_rows] words, asf [SF_WORDS][a_rows]
+extern "C" __global__ void __launch_bounds__(256) glm_moe_scatter(const int* __restrict__ exp2perm, int T,
+                                                                  int* __restrict__ rows_out,
+                                                                  const unsigned* __restrict__ xsf, int x_rows,
+                                                                  unsigned* __restrict__ asf, int a_rows) {
+  const int t = blockIdx.x * 256 + threadIdx.x, y = blockIdx.y;
+  if (t >= T) return;
+  const int4* q = reinterpret_cast<const int4*>(exp2perm + (size_t)t * TOPK);
+  const int4 a = q[0], b = q[1];
+  const int p[TOPK + 1] = {t, a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+  if (y == SF_WORDS) {
+#pragma unroll
+    for (int k = 0; k <= TOPK; ++k) rows_out[p[k]] = t;
+    return;
+  }
+  const unsigned w = xsf[(size_t)y * x_rows + t];
+#pragma unroll
+  for (int k = 0; k <= TOPK; ++k) asf[(size_t)y * a_rows + p[k]] = w;
 }
