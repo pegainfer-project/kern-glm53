@@ -161,7 +161,7 @@ using TiledMMA_O = decltype(make_tiled_mma(
 enum NamedBarriers : int {
     wg0_sync = 0,
     pair_sync = 1,  // 1 ~ 4: warps q and q^2 of one softmax warpgroup, 1 + (q&1) + 2*group
-    sm_sync = 5,    // both softmax warpgroups
+    sm_sync = 5,    // 5, 6: the four warps of both softmax warpgroups holding one 32-head half, 5 + (q&1)
 };
 
 template<typename TmaParam>

@@ -47,7 +47,7 @@ includes = ["deepgemm"]
 
 # FlashMLA's sm100 head64 sparse prefill with two softmax warpgroups (source/flashmla_h64x2/, MIT).
 [kernels."glm_flashmla2"]
-sha256 = "538948b526cb8fbf901eba43ec1081fa53972ce3c15ef188f2153f77f3755ac1"
+sha256 = "358be376f8cf490c31e0368efbc918b7ffe086ff7d94166a8e090bc9b8db3fca"
 source = "source/glm_flashmla2.cu"
 flags = "flashmla"
 includes = ["flashmla"]

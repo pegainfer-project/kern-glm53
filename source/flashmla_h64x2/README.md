@@ -14,7 +14,8 @@ warpgroup (512 threads): thread (lane quadrant q, group g) holds head (q & 1) * 
   `bar_k_valid_free` and `bar_clc_empty`; the dual GEMM's exchange buffer has 8 slots of 16 keys; the
   row maximum is exchanged over four threads through two alternating buffers (`rowwise_max_buf`), which
   also carry a pair's `li` at the end of a row (`rowwise_li_buf` gone); TMEM columns 464-467 (`LI`) carry
-  group 0's partial sums; named barriers: one per warp pair and group, `sm_sync` over both groups.
+  group 0's partial sums; named barriers: one per warp pair and group, and `sm_sync` over the four warps of both groups that
+  hold one 32-head half (two barriers of 128 threads).
 - `phase1.cuh`: the softmax loop for both groups (the dual GEMM's halves exchanged by warps q and q ^ 2
   of a group, as upstream's `retrieve_mask_and_reduce_p` does for 32 keys); each group rescales its half
   of O's columns. `li` is upstream's chain: a pair's 32 keys summed as two float2 lanes in key order,

@@ -274,6 +274,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
         const int key0 = (q/2)*(B_TOPK/2) + g*NUM_ELEMS_PER_THREAD;
         bf16* sS_base = plan.s + lane_idx*8 + (q&1)*(B_H/2)*8 + key0/8*(B_H*8);
         const int pair_barrier = NamedBarriers::pair_sync + (q&1) + 2*g;
+        const int half_barrier = NamedBarriers::sm_sync + (q&1);   // a row's four threads and its warps' vote
         float* p_send = plan.p_exchange_buf[g*4 + (q^2)] + lane_idx*4;
         float* p_recv = plan.p_exchange_buf[g*4 + q] + lane_idx*4;
         const int me = g*128 + idx_in_warpgroup;
@@ -362,7 +363,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                 float* max_buf = plan.rowwise_max_buf[xchg];
                 xchg ^= 1;
                 max_buf[me] = cur_pi_max;
-                NamedBarrier::arrive_and_wait(NUM_SM_THREADS, NamedBarriers::sm_sync);
+                NamedBarrier::arrive_and_wait(NUM_SM_THREADS/2, half_barrier);
                 cur_pi_max = max(max(cur_pi_max, max_buf[me^64]), max(max_buf[me^128], max_buf[me^192]));
                 real_mi = max(real_mi, cur_pi_max);
                 bool should_scale_o = __any_sync(0xffffffff, cur_pi_max - mi > 6.0f);
@@ -433,7 +434,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
             {
                 float* li_buf = plan.rowwise_max_buf[xchg];
                 xchg ^= 1;
-                NamedBarrier::arrive_and_wait(NUM_SM_THREADS, NamedBarriers::sm_sync);
+                NamedBarrier::arrive_and_wait(NUM_SM_THREADS/2, half_barrier);
                 if (g == 0)
                     return;
                 li = chain_li(li);
