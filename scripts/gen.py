@@ -84,8 +84,9 @@ def mla_entry():
     return entry
 
 
-# the shared expert's GEMMs by row count: BN 32 / 64 for few rows put 64-128 CTAs on the weight
-SHARED_TILES = {"shared.gu": "256:n32,1024:n64,16384:n", "shared.dn": "256:n64,16384:n"}
+# the shared expert's GEMMs by row count: BN 32 / 64 for few rows put 64-128 CTAs on the weight; from 1025 rows
+# the multicast tile (`m`, TILES below)
+SHARED_TILES = {"shared.gu": "256:n32,1024:n64,16384:m", "shared.dn": "256:n64,1024:n,16384:m"}
 LANE_ROWS = 2048  # the shared expert beside the routed path up to this many rows
 
 
