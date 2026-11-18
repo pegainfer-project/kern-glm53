@@ -95,10 +95,16 @@ using namespace deep_gemm;
 using bf16 = cutlass::bfloat16_t;
 
 static_assert(sizeof(layout::SM100BF16GemmSharedStorage<4, 2, 2, 128, 256, 64, 128, 64, bf16>) == 230400);
+// a 2-CTA cluster on M sharing B: each CTA loads half of a head's 256 columns
+static_assert(sizeof(layout::SM100BF16GemmSharedStorage<6, 2, 2, 128, 128, 64, 128, 64, bf16>) == 230400);
+
+#define GLM_BF16_BATCHED(MC, STAGES, EPILOGUE)                                                                        \
+  { auto p = reinterpret_cast<void*>(&sm100_bf16_gemm_impl<                                                         \
+        cute::UMMA::Major::K, cute::UMMA::Major::K, 0, 0, 0, 128, 256, 64, 64, 128, 128, 128, STAGES, 128, 128, MC, \
+        MC == 1, 152, 128, false, false, GemmType::Batched, false, bf16, EPILOGUE, 100>);                          \
+    asm volatile("" ::"l"(p)); }
 
 void glm_instantiate() {
-  auto p = reinterpret_cast<void*>(&sm100_bf16_gemm_impl<
-      cute::UMMA::Major::K, cute::UMMA::Major::K, 0, 0, 0, 128, 256, 64, 64, 128, 128, 128, 4, 128, 128, 1, true, 152,
-      128, false, false, GemmType::Batched, false, bf16, epilogue::GlmQuantO, 100>);
-  asm volatile("" ::"l"(p));
+  GLM_BF16_BATCHED(1, 4, epilogue::GlmQuantO)
+  GLM_BF16_BATCHED(2, 6, epilogue::GlmQuantO)
 }

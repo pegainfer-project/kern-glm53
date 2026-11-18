@@ -72,6 +72,7 @@ i32 = lambda v: {"i32": v}
 i64 = lambda v: {"i64": v}
 var = lambda v: {"var": v}
 expr = lambda e: {"expr": e}
+MC_M = expr({"mul": [{"ceil_div": [T, 256]}, 256]})  # the rows rounded up to the v up-projection's 2-CTA cluster
 st = lambda name, off=0: {"state": name, "offset": off} if off else {"state": name}
 sf_bytes = lambda k, rows: k // 512 * rows * 4  # DeepGEMM's packed UE8M0 words, [k / 512][rows]
 
@@ -473,7 +474,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
                  buf("pick"), buf("kvd"))
         step(n + "attn", "flash_mla", buf("qmla"), buf("qmla", KVL * 2), buf("kvd") if fp8kv else kv, buf("ind"),
              buf("tlen"), buf("o"), buf("ml"), buf("lse"), after=[1] if fp8kv and not full else [])
-        step(n + "uv", "uv", buf("o"), buf(n + "kvb", NOPE * KVL * 2), buf("oq"), buf("osf"), var(T))
+        step(n + "uv", "uv", buf("o"), buf(n + "kvb", NOPE * KVL * 2), buf("oq"), buf("osf"), var(T), MC_M)
         gemm(n + "o", "o", "oq", n + "w_o", "res", a_sf="osf")  # res += o_proj's output (a TMA reduce-add)
         if l < DENSE:
             step(n + "norm_post", "norm_quant", buf("res"), buf(n + "gamma_post"), buf("xq"), buf("xsf"), i32(chunk),

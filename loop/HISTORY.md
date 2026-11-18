@@ -45,3 +45,4 @@ SGLang's prompt logprobs (its fp8-KV run), and against the checkpoint before.
 | row 0 | 95.222% / 10 / 0.0555 | |
 | row 7 (`ff9ecc7`) | 95.198% / 11 / 0.0555 | 98.374% / 1 |
 | row 7 + idx's bf16 head sum (row 10's commit) | 95.276% / 10 / 0.0556 | 98.309% / 1 |
+| 25 | 46ed875 | past 256 rows the v up-projection on a 2-CTA cluster sharing W_UV | 217.11 | 1001.01 | 247.85 | -0.19% | 598 | top-1 100.000% · flips 0 (confident 0) |

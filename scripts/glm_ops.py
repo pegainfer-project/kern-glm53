@@ -170,24 +170,33 @@ def bf16_batched(n, k, rows, a, b, d, bn=256):
                 args=[{"i64": 0}, {"param": 3}, {"i32": n}, {"i32": k}, EPILOGUE, *maps], pdl=True)]}}
 
 
+# Past MC_ROWS rows the v up-projection runs on a 2-CTA cluster along M that shares B (each CTA loads half of a
+# head's 256 columns), over the rows rounded up to the cluster's 256: the pairs of M blocks must not straddle
+# heads. The rows past the call's are computed into the buffers' spare rows and never read.
+MC_ROWS, MC_ENTRY = 256, lambda e: e.replace("ELj4ELj128ELj128ELj1ELb1ELj152", "ELj6ELj128ELj128ELj2ELb0ELj152")
+
+
 VUP_ENTRY = BF16_ENTRY.format(bn=256, stages=4).replace(
     "9transform16EpilogueIdentityELm100EEEvPijjjT23_14CUtensorMap_stSC_SC_", "9GlmQuantOELm100EEEvPijjjT23_14CUtensorMap_stSB_SB_")
 
 
 def vup_quant(n, k, rows, a, b):
     """bf16_batched's v up-projection, D landing as e4m3 [b][h][n] with o_proj's packed UE8M0 scales of each
-    128 columns ([h * n / 512][rows] words). Interface: a, b, q, sf, m."""
-    stages, smem = BF16_TILE[256]
-    maps = [desc(tm(0, 0, "bf16", [k, rows, 64], list(a), [64, 128, 1], 128)),
-            desc(tm(0, 1, "bf16", [k, n, 64], list(b), [64, 256, 1], 128)),
-            desc(tm(0, 2, "u8", [n, rows, 64], [64 * n, n], [128, 128, 1], 128))]
+    128 columns ([h * n / 512][rows] words): a 1-CTA launch up to MC_ROWS rows, then the 2-CTA one.
+    Interface: a, b, q, sf, m, m rounded up to 256."""
+    maps = [[desc(tm(0, 0, "bf16", [k, rows, 64], list(a), [64, 128, 1], 128)),
+             desc(tm(0, 1, "bf16", [k, n, 64], list(b), [64, box, 1], 128)),
+             desc(tm(0, 2, "u8", [n, rows, 64], [64 * n, n], [128, 128, 1], 128))] for box in (256, 128)]
     epi = {"pack": {"size": 24, "fields": [{"at": 0, "param": 3}, {"at": 8, "i32": rows}, {"at": 12, "var": T},
                                            {"at": 16, "i32": n}, {"at": 20, "f32": 1.0}]}}
-    return {"params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<u8>", "out buffer<u8>", "i32"],
-            "impl": {"launches": [launch(
-                "glm_vup", VUP_ENTRY, [SMS, 1, 1], [256, 1, 1], smem,
-                params=["i64", "i32", "i32", "i32", "bytes<24>", *["bytes<128>"] * 3],
-                args=[{"i64": 0}, {"param": 4}, {"i32": n}, {"i32": k}, epi, *maps], pdl=True)]}}
+    params = ["i64", "i32", "i32", "i32", "bytes<24>", *["bytes<128>"] * 3]
+    one = lambda entry, m, ms, **extra: launch("glm_vup", entry, [SMS, 1, 1], [256, 1, 1], 230400, params=params,
+                                               args=[{"i64": 0}, {"param": m}, {"i32": n}, {"i32": k}, epi, *ms],
+                                               pdl=True, **extra)
+    return {"params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<u8>", "out buffer<u8>", "i32", "i32"],
+            "impl": {"launches": [one(VUP_ENTRY, 4, maps[0], when={"var": T, "max": MC_ROWS}),
+                                  one(MC_ENTRY(VUP_ENTRY), 5, maps[1], cluster=[2, 1, 1],
+                                      when={"var": T, "min": MC_ROWS + 1})]}}
 
 
 # ---- the lightning indexer over one sub-chunk of R rows: DeepGEMM's metadata kernel deals the (4-row q block, 384-key

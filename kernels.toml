@@ -38,9 +38,9 @@ flags = "deepgemm"
 includes = ["deepgemm"]
 
 # DeepGEMM's sm100 bf16 batched GEMM, unmodified, with an epilogue of ours: MLA's v up-projection landing
-# o_proj's e4m3 input and its UE8M0 scales (source/glm_vup.cu).
+# o_proj's e4m3 input and its UE8M0 scales, on one CTA or a 2-CTA cluster (source/glm_vup.cu).
 [kernels."glm_vup"]
-sha256 = "87d5672bf3e010ae11bdeaf141df4d0f1720bde5b75306be3dc93d9e1187b439"
+sha256 = "f235431c09364f8e8855fc01c71503f227c62441da3e94c20cdb27454f6b6f09"
 source = "source/glm_vup.cu"
 flags = "deepgemm"
 includes = ["deepgemm"]
