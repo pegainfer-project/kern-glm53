@@ -38,7 +38,7 @@ includes = ["deepgemm"]
 
 # FlashMLA sm100 sparse prefill, head 64, d_qk 576. Unmodified upstream instantiation.
 [kernels."glm_flashmla"]
-sha256 = "cd8e89c8e9c803479ae3894d4bb05f16a0f52fae2e6be532586a2f797e43d89c"
+sha256 = "7f19c223c47d3cf50e2fae42f2edca5f4adbbc155894a600f279fbf3548036f2"
 source = "source/glm_flashmla.cu"
 flags = "flashmla"
 includes = ["flashmla"]

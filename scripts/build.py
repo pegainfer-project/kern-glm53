@@ -5,9 +5,10 @@ A module is either compiled from `source` with its `flags` and `includes` sets a
 or copied from `prebuilt`. `--update` rewrites the pinned hashes instead of failing on a change.
 Every build also lands in kern's blob cache under its hash, where the runtime finds it.
 
-nvcc names a translation unit's internal symbols after the source's absolute path, so `source/` is
-compiled from one fixed copy (STAGE, under a lock), its include directories with it; and cicc suffixes
-some of those names with its own PID, which the PTX loses (`unpid`) before ptxas sees it. Every checkout,
+nvcc names a translation unit's internal symbols after the source's absolute path and its mtime, so
+`source/` is compiled from one fixed copy (STAGE, under a lock), its include directories with it, every
+file's mtime the epoch; and cicc suffixes some of those names with its own PID, which the PTX loses
+(`unpid`) before ptxas sees it. Every checkout,
 worktree and container builds the same bytes.
 """
 import argparse
@@ -66,13 +67,19 @@ def head(path):
                           text=True, check=True).stdout.strip()
 
 
+def copy(src, dst, ignore=None):
+    shutil.copytree(src, dst, ignore=ignore)
+    for f in dst.rglob("*"):
+        os.utime(f, (0, 0), follow_symlinks=False)
+
+
 def stage(path, stamp):
     dst = STAGE / path
-    if (dst / ".stamp").is_file() and (dst / ".stamp").read_text() == stamp:
+    if (dst / ".stamp").is_file() and (dst / ".stamp").read_text() == f"{stamp} epoch":
         return
     shutil.rmtree(dst, ignore_errors=True)
-    shutil.copytree(ROOT / path, dst, ignore=shutil.ignore_patterns(".git"))
-    (dst / ".stamp").write_text(stamp)
+    copy(ROOT / path, dst, shutil.ignore_patterns(".git"))
+    (dst / ".stamp").write_text(f"{stamp} epoch")
 
 
 @contextlib.contextmanager
@@ -85,7 +92,7 @@ def staged(cfg):
         for d in tops:
             stage(d, head(d))
         shutil.rmtree(STAGE / "source", ignore_errors=True)
-        shutil.copytree(ROOT / "source", STAGE / "source")
+        copy(ROOT / "source", STAGE / "source")
         yield
 
 
