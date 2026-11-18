@@ -81,3 +81,9 @@ defines = { EXPERTS = 256, TOPK = 8 }
 sha256 = "448042b7f709b3a6b31ad8fcffcf7871b7e02ab0c12e5ced9fbee57ed03e4523"
 source = "source/k3/copy_rows.cu"
 
+# DeepGEMM sm100 fp8 Normal GEMM, swap-AB on a 2-CTA cluster: the projections at few rows.
+[kernels."glm_fp8_tiles"]
+sha256 = "9aa76a4ef083efd8def69354f5fb0eb02bc7fece71bb08dfeed4703c3538294c"
+source = "source/glm_fp8_tiles.cu"
+flags = "deepgemm"
+includes = ["deepgemm"]

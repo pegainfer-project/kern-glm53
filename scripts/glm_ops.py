@@ -57,7 +57,7 @@ def nulled(mod, entry, params, null, grid, block):
 
 # ---- DeepGEMM sm100 fp8 1d1d: e4m3 x e4m3 -> bf16, UE8M0 scales packed four to an i32 (MN-major)
 FP8_TILE = {32: (10, 232448), 64: (7, 212992), 128: (5, 202752), 256: (3, 185344)}  # BN -> (stages, shared memory)
-# grouped swap-AB, BN 128 over a 2-CTA cluster: BM -> (stages, shared memory) (source/glm_deepgemm.cu)
+# swap-AB, BN 128 over a 2-CTA cluster: BM -> (stages, shared memory) (source/glm_deepgemm.cu, glm_fp8_tiles.cu)
 FP8_SWAP_TILE = {32: (11, 223232), 64: (10, 224256), 128: (8, 214016), 256: (6, 215040)}
 FP8_ENTRY = ("_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj128ELj128ELj0ELj0ELj0"
              "ELj{bm}ELj{bn}ELj128ELj{groups}ELj128ELj128ELj{swz}ELj{stages}ELj2ELj128ELj128ELj{mc}ELb1ELj152ELb{swap}ELb0E"
@@ -70,7 +70,7 @@ def fp8_gemm(n, k, rows, lda, ldc, sfa_rows, groups=1, bn=None, swap_bm=None, wh
     Interface: a, w, sfa, sfb, c, then m (dense) or the psum offsets of `groups` experts (grouped:
     expert g's rows end at psum[g] and start at the previous end rounded up to the block M, its weight
     rows at g * n, its scale words at g * k / 512). The tensor maps span `rows` rows of A and C.
-    `swap_bm` (grouped): swap-AB with that block M (the psum alignment), BN 128, a 2-CTA cluster."""
+    `swap_bm`: swap-AB with that block M (grouped: the psum alignment), BN 128, a 2-CTA cluster."""
     grouped = groups > 1
     kw = k // 512
     if swap_bm:
@@ -97,7 +97,7 @@ def fp8_gemm(n, k, rows, lda, ldc, sfa_rows, groups=1, bn=None, swap_bm=None, wh
     extra = {"cluster": [mc, 1, 1]} if mc > 1 else {}
     if when:
         extra["when"] = when
-    return launch("glm_deepgemm", entry, [SMS, 1, 1], [256, 1, 1], smem, params=kparams,
+    return launch("glm_fp8_tiles" if swap_bm and not grouped else "glm_deepgemm", entry, [SMS, 1, 1], [256, 1, 1], smem, params=kparams,
                   args=[*head, {"i32": n}, {"i32": k}, EPILOGUE, *maps], pdl=True, **extra), params
 
 
