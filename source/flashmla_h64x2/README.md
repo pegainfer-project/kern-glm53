@@ -20,7 +20,9 @@ warpgroup (512 threads): thread (lane quadrant q, group g) holds head (q & 1) * 
   of O's columns. `li` is upstream's chain: a pair's 32 keys summed as two float2 lanes in key order,
   group 0 summing its first 16 and leaving the float2 in TMEM, group 1 continuing it with its 16 held
   exponentials after the next `sm_sync` (the row's last block after a closing one), then
-  `fma(li, scale, x + y)`; group 1 adds its pair's `li` and writes the epilogue. `setmaxnreg`: softmax
+  `fma(li, scale, x + y)`; group 1 adds its pair's `li` and writes the epilogue. Both halves of that run after the
+  block's `so_ready` arrive, off the path to the S V GEMM. Upstream's pair barrier at the top of the loop is
+  gone: the last `sm_sync` already orders a partner's read of the exchange before the next write. `setmaxnreg`: softmax
   groups 200, the others 56.
 
 - The exponentials of S are `ex2.approx.ftz` (`exp2_ftz`), as FlashMLA's own build (`--use_fast_math`) runs

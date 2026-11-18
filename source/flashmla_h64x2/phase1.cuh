@@ -279,18 +279,20 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
         const int me = g*128 + idx_in_warpgroup;
         int xchg = 0;   // parity of rowwise_max_buf, alternating every block and once a row
         // li is upstream's chain over a thread pair's 32 keys: group 0 sums its 16 into a float2 it leaves in TMEM
-        // (column tmem_cols::LI + 2 * parity), group 1 continues it with its own 16 after the next sm_sync
+        // (column tmem_cols::LI + 2 * parity), group 1 continues it with its own 16 after the next sm_sync. Both
+        // run after so_ready, off the path to the S V GEMM.
         int lp = 0;
-        float2 d_held[NUM_ELEMS_PER_THREAD/2];
-        float scale_held = 1.0f;
-        auto chain_li = [&](float li, int parity) {
-            float2 cur_sum;
-            ku::tmem_ld_32dp32bNx<2>(tmem_cols::LI + 2*parity, &cur_sum);
+        float2 d_cur[NUM_ELEMS_PER_THREAD/2], d_prev[NUM_ELEMS_PER_THREAD/2];
+        float scale_prev = 1.0f;
+        float2 part;
+        auto chain_li = [&](float li) {
+            ku::tcgen05_after_thread_sync();
+            ku::tmem_ld_32dp32bNx<2>(tmem_cols::LI + 2*(lp^1), &part);
             cutlass::arch::fence_view_async_tmem_load();
             CUTE_UNROLL
             for (int i = 0; i < NUM_ELEMS_PER_THREAD/2; ++i)
-                cur_sum = ku::float2_add(cur_sum, d_held[i]);
-            return fma(li, scale_held, cur_sum.x + cur_sum.y);
+                part = ku::float2_add(part, d_prev[i]);
+            return fma(li, scale_prev, part.x + part.y);
         };
 
         run_outer_loop([&](const OuterloopArgs &args) {
@@ -312,8 +314,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
     
             CUTE_NO_UNROLL
             for (int k = 0; k < args.num_k_blocks; ++k) {
-                // Wait for P (and for the partner to have read the last exchange)
-                NamedBarrier::arrive_and_wait(64, pair_barrier);
+                // Wait for P. The partner has read the last exchange: it did before the last sm_sync
                 auto [buf_idx, bar_phase] = rs.get<NUM_BUFS>();
                 plan.bar_qk_nope_done[buf_idx].wait(bar_phase);
                 plan.bar_k_valid_ready[buf_idx].wait(bar_phase);    // Put the barrier wait here for more code reordering space
@@ -363,10 +364,6 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                 max_buf[me] = cur_pi_max;
                 NamedBarrier::arrive_and_wait(NUM_SM_THREADS, NamedBarriers::sm_sync);
                 cur_pi_max = max(max(cur_pi_max, max_buf[me^64]), max(max_buf[me^128], max_buf[me^192]));
-                if (g == 1 && k > 0) {
-                    ku::tcgen05_after_thread_sync();
-                    li = chain_li(li, lp^1);
-                }
                 real_mi = max(real_mi, cur_pi_max);
                 bool should_scale_o = __any_sync(0xffffffff, cur_pi_max - mi > 6.0f);
                 // By this point:
@@ -387,18 +384,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
     
                 // Calculate S
                 nv_bfloat162 s[NUM_ELEMS_PER_THREAD/2];
-                get_s_d_from_p<NUM_ELEMS_PER_THREAD>(s, d_held, p, params.sm_scale_div_log2, new_max);
-                scale_held = scale_for_old;
-                if (g == 0) {
-                    float2 cur_sum = float2 {0.0f, 0.0f};
-                    CUTE_UNROLL
-                    for (int i = 0; i < NUM_ELEMS_PER_THREAD/2; ++i)
-                        cur_sum = ku::float2_add(cur_sum, d_held[i]);
-                    ku::tmem_st_32dp32bNx<2>(tmem_cols::LI + 2*lp, &cur_sum);
-                    cutlass::arch::fence_view_async_tmem_store();
-                    ku::tcgen05_before_thread_sync();
-                }
-                lp ^= 1;
+                get_s_d_from_p<NUM_ELEMS_PER_THREAD>(s, d_cur, p, params.sm_scale_div_log2, new_max);
     
                 // Wait for last SV gemm, write S
                 if (k > 0) {
@@ -423,6 +409,23 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                 fence_view_async_shared();
                 plan.bar_so_ready.arrive();
 
+                if (g == 0) {
+                    part = float2 {0.0f, 0.0f};
+                    CUTE_UNROLL
+                    for (int i = 0; i < NUM_ELEMS_PER_THREAD/2; ++i)
+                        part = ku::float2_add(part, d_cur[i]);
+                    ku::tmem_st_32dp32bNx<2>(tmem_cols::LI + 2*lp, &part);
+                    cutlass::arch::fence_view_async_tmem_store();
+                    ku::tcgen05_before_thread_sync();
+                } else if (k > 0) {
+                    li = chain_li(li);
+                }
+                CUTE_UNROLL
+                for (int i = 0; i < NUM_ELEMS_PER_THREAD/2; ++i)
+                    d_prev[i] = d_cur[i];
+                scale_prev = scale_for_old;
+                lp ^= 1;
+
                 rs.update();
             }
 
@@ -433,8 +436,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                 NamedBarrier::arrive_and_wait(NUM_SM_THREADS, NamedBarriers::sm_sync);
                 if (g == 0)
                     return;
-                ku::tcgen05_after_thread_sync();
-                li = chain_li(li, lp^1);
+                li = chain_li(li);
                 li_buf[me] = li;
                 NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
                 li += li_buf[me^64];

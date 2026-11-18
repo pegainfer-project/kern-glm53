@@ -25,3 +25,4 @@ is that A/B's. Numerics are `loop/longcheck`'s long pass against the row above.
 | 13 | 083031f | latent lift on lane 1 beside the query chain; up to 2048 rows the shared expert beside the routed experts | 231.02 | 1070.40 | 263.92 | -0.46% | 553 | top-1 100.000% · flips 0 (confident 0) |
 | 14 | 5c8f061 | flash_mla's softmax on two warpgroups, sixteen keys a thread | 229.36 | 1060.69 | 261.95 | -0.75% | 553 | top-1 100.000% · flips 0 (confident 0) |
 | 15 | bec98eb | flash_mla's exponentials ex2.approx.ftz, as FlashMLA's own build | 228.21 | 1053.94 | 260.58 | -0.52% | 553 | top-1 100.000% · flips 0 (confident 0) |
+| 16 | 0d6b950 | flash_mla's li bookkeeping after so_ready, first pair barrier gone | 227.40 | 1050.26 | 259.66 | -0.35% | 553 | top-1 100.000% · flips 0 (confident 0) |
