@@ -1,7 +1,8 @@
 // The indexer's top-k, k31_topk's set (source/k31/k31_topk.cu): each row's 2048 largest bf16 logits
 // among its first `lens[r]`, ties by smaller position, ascending, the same bytes every run.
 //
-//   extern "C" __global__ void glm_topk(const bf16* logits, int stride, const int* lens, int* out);
+//   extern "C" __global__ void glm_topk(const bf16* logits, int stride, const int* lens, int* out,
+//                                       const unsigned* ks, int* tlen, unsigned char* pick);
 //   grid (rows), block NT, dynamic smem glm_topk_smem
 //
 // A row of at most HELD_MAX takes k31_topk_held's route. A longer row's sample (k31_topk's, read in
@@ -254,18 +255,11 @@ __device__ __forceinline__ void exact_row(Smem& s, const bf16* row, unsigned n, 
   for (int j = 0; j < TK / NT; ++j) o[t * (TK / NT) + j] = k[j];
 }
 
-extern "C" __global__ void __launch_bounds__(NT, 2) glm_topk(const bf16* __restrict__ logits, int stride,
-                                                            const int* __restrict__ lens, int* __restrict__ out) {
-  asm volatile("griddepcontrol.launch_dependents;");
-  asm volatile("griddepcontrol.wait;" ::: "memory");
-  extern __shared__ __align__(16) unsigned char dyn[];
+// The row's 2048 as positions relative to its first key into o, by the route its length takes.
+__device__ __forceinline__ void row_topk(unsigned char* dyn, const bf16* row, unsigned n, int* o) {
   Smem& s = *reinterpret_cast<Smem*>(dyn);
-  const int t = threadIdx.x;
-  const bf16* row = logits + (size_t)blockIdx.x * stride;
-  const unsigned n = (unsigned)max(lens[blockIdx.x], 0);
-  int* o = out + (size_t)blockIdx.x * TK;
   if (n <= TK) {
-    for (int i = t; i < TK; i += NT) o[i] = i < (int)n ? i : -1;
+    for (int i = threadIdx.x; i < TK; i += NT) o[i] = i < (int)n ? i : -1;
     return;
   }
   if (n <= HELD_MAX) {
@@ -279,4 +273,29 @@ extern "C" __global__ void __launch_bounds__(NT, 2) glm_topk(const bf16* __restr
   if (n <= 1u << 20 && stream(s, row, n, sample_key(s, row, n, 16 * TK * 9 / 8), o)) return;
   __syncthreads();
   exact_row(s, row, n, o);
+}
+
+// Then, as rows of glm_kv_dequant's stream (glm_glue's glm_topk_stream): each position offset by the row's
+// first key ks, each picked key flagged in `pick` (may be null), the row's live count min(lens, 2048) in tlen.
+extern "C" __global__ void __launch_bounds__(NT, 2) glm_topk(const bf16* __restrict__ logits, int stride,
+                                                            const int* __restrict__ lens, int* __restrict__ out,
+                                                            const unsigned* __restrict__ ks, int* __restrict__ tlen,
+                                                            unsigned char* __restrict__ pick) {
+  asm volatile("griddepcontrol.launch_dependents;");
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+  extern __shared__ __align__(16) unsigned char dyn[];
+  const int t = threadIdx.x, r = blockIdx.x;
+  int* o = out + (size_t)r * TK;
+  row_topk(dyn, logits + (size_t)r * stride, (unsigned)max(lens[r], 0), o);
+  __syncthreads();
+  const int base = (int)ks[r];
+  int4 v = reinterpret_cast<int4*>(o)[t];
+  int* w = &v.x;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    w[i] = w[i] < 0 ? -1 : base + w[i];
+    if (pick && w[i] >= 0) pick[w[i]] = 1;
+  }
+  reinterpret_cast<int4*>(o)[t] = v;
+  if (t == 0) tlen[r] = min(lens[r], TK);
 }

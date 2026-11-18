@@ -217,11 +217,12 @@ def meta_words(r):
     return (3 * SMS + 1) // 2 * 2 + 2 * -(-r // BLOCK_Q)
 
 
-def indexer(j, r, kv_cap):
+def indexer(j, r, kv_cap, pick_rows):
     """Interface: iq [., 32, 128] u8, kg [kv_cap, 128] u8, ksf [kv_cap] f32, w [., 32] bf16, ks, ke u32,
-    zero, klen i32, logits bf16, ind i32 [., 2048] out, then num_q, num_kv, stride, and the schedule
-    [meta_words(r)] i32 out. Every row pointer is the call's, offset to the sub-chunk's first row; the
-    logits and the schedule are the sub-chunk's own."""
+    zero, klen i32, logits bf16, ind i32 [., 2048] out, then num_q, num_kv, stride, the schedule
+    [meta_words(r)] i32 out, then base u32 (the stream offset the picks take on), tlen i32 out and the pick
+    flags u8 [ctx] (set by calls of at most pick_rows rows). Every row pointer is the call's, offset to the
+    sub-chunk's first row; the logits and the schedule are the sub-chunk's own."""
     when = {"var": T, "min": j * r + 1}
     sf = tm(0, 2, "f32", [kv_cap, 1], [kv_cap * 4], [128, 1])
     maps = [desc(tm(0, 0, "u8", [128, r * 32], [128], [128, 128], 128)), desc(sf),
@@ -235,13 +236,18 @@ def indexer(j, r, kv_cap):
                          *["bytes<128>"] * 5],
                  args=[{"param": 10}, {"param": 11}, {"param": 12}, {"param": 4}, {"param": 5}, {"param": 13},
                        {"param": 8}, *maps], when=when, pdl=True)
-    topk = launch("glm_topk", "glm_topk", [{"clamp": [T, j * r, r]}, 1, 1], [512, 1, 1], TOPK_SMEM,
-                  params=["in buffer<bf16>", "i32", "in buffer<i32>", "out buffer<i32>"],
-                  args=[{"param": 8}, {"param": 12}, {"param": 7}, {"param": 9}], when=when, pdl=True)
+    topk_params = ["in buffer<bf16>", "i32", "in buffer<i32>", "out buffer<i32>", "in buffer<u32>", "out buffer<i32>",
+                   "inout buffer<u8>"]
+    topk_args = [{"param": 8}, {"param": 12}, {"param": 7}, {"param": 9}, {"param": 14}, {"param": 15}, {"param": 16}]
+    topk = lambda lo, hi, picks: launch(
+        "glm_topk", "glm_topk", [{"clamp": [T, j * r, r]}, 1, 1], [512, 1, 1], TOPK_SMEM,
+        params=topk_params if picks else [*topk_params[:6], "i64"], args=topk_args if picks else [*topk_args[:6], {"i64": 0}],
+        when={"var": T, "min": lo, **({"max": hi} if hi else {})}, pdl=True)
+    topks = ([topk(j * r + 1, pick_rows, True)] if j * r < pick_rows else []) + [topk(max(j * r, pick_rows) + 1, 0, False)]
     return {"params": ["in buffer<u8>", "in buffer<u8>", "in buffer<f32>", "in buffer<bf16>", "in buffer<u32>",
                        "in buffer<u32>", "in buffer<i32>", "in buffer<i32>", "out buffer<bf16>", "out buffer<i32>",
-                       "i32", "i32", "i32", "out buffer<i32>"],
-            "impl": {"launches": [meta, mqa, topk]}}
+                       "i32", "i32", "i32", "out buffer<i32>", "in buffer<u32>", "out buffer<i32>", "inout buffer<u8>"],
+            "impl": {"launches": [meta, mqa, *topks]}}
 
 
 # ---- FlashMLA sm100 sparse prefill, 64 heads, d_qk 576 (512 latent | 64 rope), d_v 512

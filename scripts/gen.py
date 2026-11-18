@@ -165,10 +165,6 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
         "topk_slots": G.plain("glm_glue", "glm_topk_slots",
                               ["inout buffer<i32>", "in buffer<i32>", "i32", "in buffer<i32>", "in buffer<i32>",
                                "out buffer<i32>", "i32"], [T, 1, 1], [256, 1, 1]),
-        # the pick flags pay off while a chunk picks a small part of its context: up to PICK_ROWS rows
-        "topk_stream": G.picked("glm_glue", "glm_topk_stream",
-                                ["inout buffer<i32>", "in buffer<u32>", "in buffer<i32>", "out buffer<i32>",
-                                 "inout buffer<u8>", "i32"], 4, [T, 1, 1], [256, 1, 1], PICK_ROWS),
         "kv_dequant": G.picked("glm_glue", "glm_kv_dequant",
                                ["in state", "in buffer<i32>", "i32", "in buffer<i32>", "i32", "in buffer<u8>",
                                 "out buffer<bf16>"], 5, [{"add": [{"ceil_div": [CTX, PAGE]}, S]}, 1, 1], [256, 1, 1],
@@ -220,7 +216,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
     ops["mla_prep_full"] = G.plain("glm_glue", prep, prep_params, [T, 1, 1], [256, 1, 1])
     ops["mla_prep_shared"] = G.nulled("glm_glue", prep, prep_params, {8, 9, 10}, [T, 1, 1], [256, 1, 1])
     for j in range(chunk // sub):
-        ops[f"indexer.{j}"] = G.indexer(j, sub, max_ctx)
+        ops[f"indexer.{j}"] = G.indexer(j, sub, max_ctx, PICK_ROWS if kv_dtype == "fp8" else 0)
 
     gemms = {
         "a.full": (NA[True], H, chunk, H, NA[True], chunk, 1),
@@ -459,11 +455,8 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
                      buf("wout", r0 * IH * 2), buf("ks", r0 * 4), buf("ke", r0 * 4), buf("zero", r0 * 4),
                      buf("klen", r0 * 4), buf("logits"), buf("ind", r0 * G.TOPK * 4),
                      expr({"clamp": [T, r0, sub]}), var(CTX), expr({"mul": [{"ceil_div": [CTX, 256]}, 256]}),
-                     buf("imeta"))
-            if fp8kv:
-                step(n + "topk_stream", "topk_stream", buf("ind"), buf("ks"), buf("klen"), buf("tlen"), buf("pick"),
-                     var(T))
-            else:
+                     buf("imeta"), buf("ks" if fp8kv else "zero", r0 * 4), buf("tlen", r0 * 4), buf("pick"))
+            if not fp8kv:
                 step(n + "topk_slots", "topk_slots", buf("ind"), buf("block_table"), i32(max_pages), buf("row_seq"),
                      buf("klen"), buf("tlen"), var(T))
         else:

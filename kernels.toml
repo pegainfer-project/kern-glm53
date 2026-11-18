@@ -56,7 +56,7 @@ defines = { GLM_SMEM = 231728 }
 # The indexer's top-k over kern-k31's (source/k31/README.md): vLLM's top-2048 set in ascending positions,
 # deterministic; a long row read once against its sample's threshold (source/glm_topk.cu).
 [kernels."glm_topk"]
-sha256 = "a9187fa812d24b52a4b1c1e1df68c96b2603a8e4c5e69dd3ab760934aa681d29"
+sha256 = "65e69b9cbc32416c3b3e4af3bc404d674030ab468928438c09cc5b01be912e0c"
 source = "source/glm_topk.cu"
 
 [kernels."glm_glue"]
