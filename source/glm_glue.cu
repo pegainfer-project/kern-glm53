@@ -156,30 +156,30 @@ __device__ __forceinline__ void quant8(const float v[8], u8* q, u8* sf, int sf_r
   if ((threadIdx.x & 15) == 0) put_sf(sf, sf_rows, r, kb, e);
 }
 
-// res = bf16(a + res) (a may be null: res is already the stream), normed = rms(res) * gamma (normed may
-// be null), and normed quantized per 128 columns (q may be null).
-//   grid (T), block 256: thread t owns the 8 columns 8 (t + 256 i), i < 3; a half-warp a column block.
+// res = bf16(a + res) (no addend: res is already the stream), normed = rms(res) * gamma (normed may be
+// null), and normed quantized per 128 columns (q may be null); add(c, x) fills the addend's eight columns
+// c.. of the row into x, false when there is none.
+//   thread t owns the 8 columns 8 (t + 256 i), i < 3; a half-warp a column block.
 // The sum of squares keeps one order, the row read back from shared memory: lane l of warp w sums
 // columns 128 (6 w + i) + 4 l + j in (i, j) order, then the block's tree.
-extern "C" __global__ void __launch_bounds__(256) glm_add_rms_quant(
-    const bf16* __restrict__ a, bf16* __restrict__ res, const bf16* __restrict__ gamma, bf16* __restrict__ normed,
-    u8* __restrict__ q, u8* __restrict__ sf, int sf_rows, int T) {
+template <typename Add>
+__device__ __forceinline__ void rms_quant_row(int r, Add add, bf16* __restrict__ res, const bf16* __restrict__ gamma,
+                                              bf16* __restrict__ normed, u8* __restrict__ q, u8* __restrict__ sf,
+                                              int sf_rows) {
   __shared__ float sm[8];
   __shared__ __align__(16) bf16 xs[H];
-  const int r = blockIdx.x, t = threadIdx.x, w = t >> 5, l = t & 31;
+  const int t = threadIdx.x, w = t >> 5, l = t & 31;
   bf16* row = res + (size_t)r * H;
   float v[3][8], ss = 0.f;
 #pragma unroll
   for (int i = 0; i < 3; ++i) ld8(row + (t + 256 * i) * 8, v[i]);
-  if (a) {
 #pragma unroll
-    for (int i = 0; i < 3; ++i) {
-      float x[8];
-      ld8(a + (size_t)r * H + (t + 256 * i) * 8, x);
+  for (int i = 0; i < 3; ++i) {
+    float x[8];
+    if (!add((t + 256 * i) * 8, x)) break;
 #pragma unroll
-      for (int j = 0; j < 8; ++j) v[i][j] = rnd(v[i][j] + x[j]);
-      st8(row + (t + 256 * i) * 8, v[i]);
-    }
+    for (int j = 0; j < 8; ++j) v[i][j] = rnd(v[i][j] + x[j]);
+    st8(row + (t + 256 * i) * 8, v[i]);
   }
 #pragma unroll
   for (int i = 0; i < 3; ++i) st8(xs + (t + 256 * i) * 8, v[i]);
@@ -202,6 +202,18 @@ extern "C" __global__ void __launch_bounds__(256) glm_add_rms_quant(
     if (normed) st8(normed + (size_t)r * H + c, y);
     if (q) quant8(y, q + (size_t)r * H + c, sf, sf_rows, r, c >> 7);
   }
+}
+
+// rms_quant_row with the addend a (may be null).   grid (T), block 256
+extern "C" __global__ void __launch_bounds__(256) glm_add_rms_quant(
+    const bf16* __restrict__ a, bf16* __restrict__ res, const bf16* __restrict__ gamma, bf16* __restrict__ normed,
+    u8* __restrict__ q, u8* __restrict__ sf, int sf_rows, int T) {
+  const int r = blockIdx.x;
+  rms_quant_row(r, [&](int c, float x[8]) {
+    if (!a) return false;
+    ld8(a + (size_t)r * H + c, x);
+    return true;
+  }, res, gamma, normed, q, sf, sf_rows);
 }
 
 // act = bf16(silu(g) * u) over gate | up halves of gu [rows, 2I], quantized per 128 columns into
@@ -560,6 +572,20 @@ extern "C" __global__ void __launch_bounds__(384) glm_moe_gather(const u8* __res
   }
 }
 
+// The combined row's eight columns c..: bf16(sum_k wts[t, k] * fc2[sp[k]] + shared[t]), sums in f32.
+__device__ __forceinline__ void combine8(const bf16* __restrict__ fc2, const int* sp, const float* sw,
+                                         const bf16* __restrict__ shared, int t, int c, float acc[8]) {
+  float v[8];
+  ld8(shared + (size_t)t * H + c, acc);
+#pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    if (sp[k] < 0) continue;
+    ld8(fc2 + (size_t)sp[k] * H + c, v);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[j] += sw[k] * v[j];
+  }
+}
+
 // out[t] = bf16(sum_k wts[t, k] * fc2[exp2perm[t * 8 + k]] + shared[t]), sums in f32.
 //   grid (T), block 256: 24 columns a thread, eight at a time
 extern "C" __global__ void __launch_bounds__(256) glm_moe_combine(const bf16* __restrict__ fc2,
@@ -575,15 +601,8 @@ extern "C" __global__ void __launch_bounds__(256) glm_moe_combine(const bf16* __
 #pragma unroll
   for (int i = 0; i < 3; ++i) {
     const int c = (i * 256 + threadIdx.x) * 8;
-    float acc[8], v[8];
-    ld8(shared + (size_t)t * H + c, acc);
-#pragma unroll
-    for (int k = 0; k < 8; ++k) {
-      if (sp[k] < 0) continue;
-      ld8(fc2 + (size_t)sp[k] * H + c, v);
-#pragma unroll
-      for (int j = 0; j < 8; ++j) acc[j] += sw[k] * v[j];
-    }
+    float acc[8];
+    combine8(fc2, sp, sw, shared, t, c, acc);
     __nv_bfloat162 h[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) h[j] = __floats2bfloat162_rn(acc[2 * j], acc[2 * j + 1]);
@@ -591,3 +610,22 @@ extern "C" __global__ void __launch_bounds__(256) glm_moe_combine(const bf16* __
   }
 }
 
+// The combine and the next layer's input norm in one pass: the combined row (bf16, as glm_moe_combine
+// writes it) is rms_quant_row's addend, so it never goes to memory; res and the e4m3 row as
+// glm_add_rms_quant writes them.   grid (T), block 256
+extern "C" __global__ void __launch_bounds__(256) glm_combine_quant(
+    const bf16* __restrict__ fc2, const int* __restrict__ exp2perm, const float* __restrict__ wts,
+    const bf16* __restrict__ shared, bf16* __restrict__ res, const bf16* __restrict__ gamma, u8* __restrict__ q,
+    u8* __restrict__ sf, int sf_rows, int T) {
+  __shared__ int sp[8];
+  __shared__ float sw[8];
+  const int t = blockIdx.x;
+  if (threadIdx.x < 8) sp[threadIdx.x] = exp2perm[t * 8 + threadIdx.x], sw[threadIdx.x] = wts[t * 8 + threadIdx.x];
+  __syncthreads();
+  rms_quant_row(t, [&](int c, float x[8]) {
+    combine8(fc2, sp, sw, shared, t, c, x);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) x[j] = rnd(x[j]);
+    return true;
+  }, res, gamma, nullptr, q, sf, sf_rows);
+}

@@ -187,6 +187,10 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
         "moe_combine": G.plain("glm_glue", "glm_moe_combine",
                                ["in buffer<bf16>", "in buffer<i32>", "in buffer<f32>", "in buffer<bf16>",
                                 "out buffer<bf16>", "i32"], [T, 1, 1], [256, 1, 1]),
+        "combine_quant": G.plain("glm_glue", "glm_combine_quant",
+                                 ["in buffer<bf16>", "in buffer<i32>", "in buffer<f32>", "in buffer<bf16>",
+                                  "inout buffer<bf16>", "in buffer<bf16>", "out buffer<u8>", "out buffer<u8>", "i32",
+                                  "i32"], [T, 1, 1], [256, 1, 1]),
         "last_rows": {"params": ["out buffer<bf16>", "in buffer<bf16>", "in buffer<i64>", "i32", "i32"],
                       "impl": {"launches": [G.launch("copy_rows", "kern_last_rows_bf16", [S, 1, 1], [1024, 1, 1])]}},
         "head_norm": G.nulled("glm_glue", "glm_add_rms_quant",
@@ -379,6 +383,8 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
 
     plan(first)
     step("embed", "embed", buf("token_ids"), buf("embed"), buf("res"), var(T), i32(H))
+    # a MoE layer's combine takes the next layer's input norm when that layer shares the picks (never a cut)
+    fused = lambda l: max(first, DENSE) <= l < layers - 1 and l + 1 not in FULL
     for l in range(first, layers):
         full = l in FULL
         n = f"L{l}."
@@ -421,7 +427,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
         elif full:
             step(n + "norm_in", "add_rms_quant", buf("h"), buf("res"), buf(n + "gamma_in"), buf("xn"), buf("xq"),
                  buf("xsf"), i32(chunk), var(T))
-        else:
+        elif not fused(l - 1):
             step(n + "norm_in", "add_quant", buf("h"), buf("res"), buf(n + "gamma_in"), buf("xq"), buf("xsf"),
                  i32(chunk), var(T))
         gemm(n + "a", "a.full" if full else "a.shared", "xq", n + "w_a", "qa")
@@ -513,7 +519,11 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
              buf("psum"))
         gemm(n + "fc2", "moe.dn", "mq2", n + "w_2", "f2", a_sf="msf2")
         shared_expert(n, "", after=[1])
-        step(n + "combine", "moe_combine", buf("f2"), buf("exp2perm"), buf("wts"), buf("sh"), buf("h"), var(T))
+        if fused(l):
+            step(n + "combine", "combine_quant", buf("f2"), buf("exp2perm"), buf("wts"), buf("sh"), buf("res"),
+                 buf(f"L{l + 1}.gamma_in"), buf("xq"), buf("xsf"), i32(chunk), var(T))
+        else:
+            step(n + "combine", "moe_combine", buf("f2"), buf("exp2perm"), buf("wts"), buf("sh"), buf("h"), var(T))
 
     if head:
         step("head.h", "last_rows", buf("hl"), buf("h"), buf("cu_seqlens"), i32(H), i32(H))

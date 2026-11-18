@@ -60,7 +60,7 @@ sha256 = "a9187fa812d24b52a4b1c1e1df68c96b2603a8e4c5e69dd3ab760934aa681d29"
 source = "source/glm_topk.cu"
 
 [kernels."glm_glue"]
-sha256 = "5d61103542542962fac56565e19891c8975259972d93b428a734a1c87e1c0205"
+sha256 = "b8723ad41eb73d0c0ec472e419db853f6dd405e18b2b2080272fa8e7ad261aa3"
 source = "source/glm_glue.cu"
 
 [kernels."glm_moe"]
