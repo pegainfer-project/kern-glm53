@@ -57,7 +57,7 @@ sha256 = "bb53876cdf32e1a41f5c4b6946c7fcb0e5d781295badb72b9271fb883d1140b3"
 source = "source/k31/k31_topk.cu"
 
 [kernels."glm_glue"]
-sha256 = "cfe11d949030c4309d236e5eb8ebe69c6e3cf9f1d7e00c22b7be5aeabaf61fb5"
+sha256 = "5d61103542542962fac56565e19891c8975259972d93b428a734a1c87e1c0205"
 source = "source/glm_glue.cu"
 
 [kernels."glm_moe"]

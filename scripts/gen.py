@@ -184,6 +184,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
     norm_params = ["in buffer<bf16>", "inout buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "out buffer<u8>",
                    "out buffer<u8>", "i32", "i32"]
     ops["add_rms_quant"] = G.plain("glm_glue", "glm_add_rms_quant", norm_params, [T, 1, 1], [256, 1, 1])
+    ops["add_quant"] = G.nulled("glm_glue", "glm_add_rms_quant", norm_params, {3}, [T, 1, 1], [256, 1, 1])
     ops["rms_quant"] = G.nulled("glm_glue", "glm_add_rms_quant", norm_params, {0}, [T, 1, 1], [256, 1, 1])
     prep_params = ["in buffer<bf16>", "i32", "in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "in buffer<i32>",
                    "in buffer<i64>", "inout state", "inout state", "in buffer<bf16>", "in buffer<bf16>", "out buffer<u8>",
@@ -376,12 +377,15 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
             weight(n + "w_p", [IH, H], [seg(a + "indexer.weights_proj.weight")])
 
         # attention
-        if l == first:
+        if l == first:  # the bf16 row goes on only to the indexer's weights_proj and the router
             step(n + "norm_in", "rms_quant", buf("res"), buf(n + "gamma_in"), buf("xn"), buf("xq"), buf("xsf"),
                  i32(chunk), var(T))
-        else:
+        elif full:
             step(n + "norm_in", "add_rms_quant", buf("h"), buf("res"), buf(n + "gamma_in"), buf("xn"), buf("xq"),
                  buf("xsf"), i32(chunk), var(T))
+        else:
+            step(n + "norm_in", "add_quant", buf("h"), buf("res"), buf(n + "gamma_in"), buf("xq"), buf("xsf"),
+                 i32(chunk), var(T))
         gemm(n + "a", "a.full" if full else "a.shared", "xq", n + "w_a", "qa")
         kv = st(f"kv.{l}")
         if full:
@@ -422,8 +426,12 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
              buf("tlen"), buf("o"), buf("ml"), buf("lse"))
         step(n + "uv", "uv", buf("o"), buf(n + "kvb", NOPE * KVL * 2), buf("oq"), buf("osf"), var(T))
         gemm(n + "o", "o", "oq", n + "w_o", "h", a_sf="osf")
-        step(n + "norm_post", "add_rms_quant", buf("h"), buf("res"), buf(n + "gamma_post"), buf("xn"), buf("xq"),
-             buf("xsf"), i32(chunk), var(T))
+        if l < DENSE:
+            step(n + "norm_post", "add_quant", buf("h"), buf("res"), buf(n + "gamma_post"), buf("xq"), buf("xsf"),
+                 i32(chunk), var(T))
+        else:
+            step(n + "norm_post", "add_rms_quant", buf("h"), buf("res"), buf(n + "gamma_post"), buf("xn"), buf("xq"),
+                 buf("xsf"), i32(chunk), var(T))
 
         # MLP
         if l < DENSE:

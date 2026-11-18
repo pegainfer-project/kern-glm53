@@ -124,40 +124,83 @@ extern "C" __global__ void glm_plan(const long long* __restrict__ cu, const int*
   zero[r] = 0;
 }
 
-// res = bf16(a + res) (a may be null: res is already the stream), normed = rms(res) * gamma, and
-// normed quantized per 128 columns (q may be null).
-//   grid (T), block 256: warp w owns column blocks 6w .. 6w + 5
+__device__ __forceinline__ void ld8(const bf16* p, float v[8]) {
+  const uint4 u = *reinterpret_cast<const uint4*>(p);
+  const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&u);
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const float2 f = __bfloat1622float2(h[j]);
+    v[2 * j] = f.x, v[2 * j + 1] = f.y;
+  }
+}
+__device__ __forceinline__ void st8(bf16* p, const float v[8]) {
+  uint4 u;
+  __nv_bfloat162* h = reinterpret_cast<__nv_bfloat162*>(&u);
+#pragma unroll
+  for (int j = 0; j < 4; ++j) h[j] = __floats2bfloat162_rn(v[2 * j], v[2 * j + 1]);
+  *reinterpret_cast<uint4*>(p) = u;
+}
+
+// Eight values of one lane in a half-warp's 128-column block quantized: the lane writes its 8 bytes, the
+// half-warp's first lane the scale.
+__device__ __forceinline__ void quant8(const float v[8], u8* q, u8* sf, int sf_rows, int r, int kb) {
+  float m = 0.f;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) m = fmaxf(m, fabsf(v[j]));
+#pragma unroll
+  for (int o = 8; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+  u8 e;
+  const float inv = 1.f / ue8m0(m, 1e-10f, &e);
+  *reinterpret_cast<uint2*>(q) = make_uint2(fp8x4(v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv),
+                                            fp8x4(v[4] * inv, v[5] * inv, v[6] * inv, v[7] * inv));
+  if ((threadIdx.x & 15) == 0) put_sf(sf, sf_rows, r, kb, e);
+}
+
+// res = bf16(a + res) (a may be null: res is already the stream), normed = rms(res) * gamma (normed may
+// be null), and normed quantized per 128 columns (q may be null).
+//   grid (T), block 256: thread t owns the 8 columns 8 (t + 256 i), i < 3; a half-warp a column block.
+// The sum of squares keeps one order, the row read back from shared memory: lane l of warp w sums
+// columns 128 (6 w + i) + 4 l + j in (i, j) order, then the block's tree.
 extern "C" __global__ void __launch_bounds__(256) glm_add_rms_quant(
     const bf16* __restrict__ a, bf16* __restrict__ res, const bf16* __restrict__ gamma, bf16* __restrict__ normed,
     u8* __restrict__ q, u8* __restrict__ sf, int sf_rows, int T) {
   __shared__ float sm[8];
-  const int r = blockIdx.x, w = threadIdx.x >> 5, l = threadIdx.x & 31;
+  __shared__ __align__(16) bf16 xs[H];
+  const int r = blockIdx.x, t = threadIdx.x, w = t >> 5, l = t & 31;
   bf16* row = res + (size_t)r * H;
-  float v[6][4], ss = 0.f;
+  float v[3][8], ss = 0.f;
+#pragma unroll
+  for (int i = 0; i < 3; ++i) ld8(row + (t + 256 * i) * 8, v[i]);
+  if (a) {
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+      float x[8];
+      ld8(a + (size_t)r * H + (t + 256 * i) * 8, x);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) v[i][j] = rnd(v[i][j] + x[j]);
+      st8(row + (t + 256 * i) * 8, v[i]);
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < 3; ++i) st8(xs + (t + 256 * i) * 8, v[i]);
+  __syncthreads();
 #pragma unroll
   for (int i = 0; i < 6; ++i) {
-    const int c = (w * 6 + i) * 128 + l * 4;
-    ld4(row + c, v[i]);
-    if (a) {
-      float x[4];
-      ld4(a + (size_t)r * H + c, x);
+    float u[4];
+    ld4(xs + (w * 6 + i) * 128 + l * 4, u);
 #pragma unroll
-      for (int j = 0; j < 4; ++j) v[i][j] = rnd(v[i][j] + x[j]);
-      st4(row + c, v[i]);
-    }
-#pragma unroll
-    for (int j = 0; j < 4; ++j) ss += v[i][j] * v[i][j];
+    for (int j = 0; j < 4; ++j) ss += u[j] * u[j];
   }
   const float rr = rsqrtf(block_sum(ss, sm) / H + EPS);
 #pragma unroll
-  for (int i = 0; i < 6; ++i) {
-    const int kb = w * 6 + i, c = kb * 128 + l * 4;
-    float g[4], y[4];
-    ld4(gamma + c, g);
+  for (int i = 0; i < 3; ++i) {
+    const int c = (t + 256 * i) * 8;
+    float g[8], y[8];
+    ld8(gamma + c, g);
 #pragma unroll
-    for (int j = 0; j < 4; ++j) y[j] = rnd(rnd(v[i][j] * rr) * g[j]);
-    if (normed) st4(normed + (size_t)r * H + c, y);
-    if (q) quant4(y, q + (size_t)r * H + c, sf, sf_rows, r, kb, 1e-10f);
+    for (int j = 0; j < 8; ++j) y[j] = rnd(rnd(v[i][j] * rr) * g[j]);
+    if (normed) st8(normed + (size_t)r * H + c, y);
+    if (q) quant8(y, q + (size_t)r * H + c, sf, sf_rows, r, c >> 7);
   }
 }
 
@@ -519,16 +562,6 @@ extern "C" __global__ void __launch_bounds__(384) glm_moe_gather(const u8* __res
 
 // out[t] = bf16(sum_k wts[t, k] * fc2[exp2perm[t * 8 + k]] + shared[t]), sums in f32.
 //   grid (T), block 256: 24 columns a thread, eight at a time
-__device__ __forceinline__ void ld8(const bf16* p, float v[8]) {
-  const uint4 u = *reinterpret_cast<const uint4*>(p);
-  const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&u);
-#pragma unroll
-  for (int j = 0; j < 4; ++j) {
-    const float2 f = __bfloat1622float2(h[j]);
-    v[2 * j] = f.x, v[2 * j + 1] = f.y;
-  }
-}
-
 extern "C" __global__ void __launch_bounds__(256) glm_moe_combine(const bf16* __restrict__ fc2,
                                                                   const int* __restrict__ exp2perm,
                                                                   const float* __restrict__ wts,
