@@ -38,9 +38,9 @@ checkpoint (GLM-5.2-FP8 has the same tensors).
 
 | module | what | provenance |
 |---|---|---|
-| `glm_deepgemm` | fp8 1d1d GEMMs (dense, m-grouped psum), bf16 batched GEMM (W_UK, W_UV), fp8 MQA logits | new upstream: DeepGEMM `ab69f76b`, MIT |
+| `glm_deepgemm` | fp8 1d1d GEMMs (dense, m-grouped psum), bf16 batched GEMM (W_UK, W_UV), fp8 MQA logits (bf16 out) and its schedule | new upstream: DeepGEMM `ab69f76b`, MIT |
 | `glm_flashmla` | sparse MLA prefill, 64 heads, d_qk 576 | new upstream: FlashMLA `4f38f29e`, MIT |
-| `k31_topk` | the indexer's top-2048 per row: vLLM's set, ascending, the same bytes every run | from kern-k31 `c4a820a` (`source/k31/`) |
+| `k31_topk` | the indexer's top-2048 per row of bf16 logits: vLLM's set, ascending, the same bytes every run | from kern-k31 `f4ddc91` (`source/k31/`) |
 | `glm_glue` | norms, quantization, rope, cache writes, row plan, MoE gather / combine | ours, after vLLM's GLM-5 math |
 | `glm_prep` | load-time UE8M0 re-quantization, kv_b split, the routed scaling fill | ours, after vLLM's `requant_weight_ue8m0` |
 | `k3_router_argmax+EXPERTS=256+TOPK=8` | router top-8, vocab argmax | rebuilt from K3 with new defines (`source/k3/README.md`) |

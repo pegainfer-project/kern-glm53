@@ -119,10 +119,10 @@ def bf16_batched(n, k, rows, a, b, d, bn=256):
 
 
 # ---- the lightning indexer over one sub-chunk of R rows: DeepGEMM's metadata kernel deals the (4-row q block, 256-key
-# split) work evenly over the SMs, its fp8 MQA logits follow it (compressed: row r's logits at [r][0, ke - ks)), then
-# each row's top-k (k31_topk: vLLM's set, ascending, the same bytes every run)
+# split) work evenly over the SMs, its fp8 MQA logits follow it (bf16, compressed: row r's logits at [r][0, ke - ks)),
+# then each row's top-k (k31_topk_held: vLLM's set, ascending, the same bytes every run; a row of at most 32k read once)
 MQA_ENTRY = ("_ZN9deep_gemm16sm100_mqa_logitsILj32ELj128ELb0ELb1ELb0ELb1ELj4ELj256ELj3ELj5ELj152ELj128ELj256E"
-             "N7cutlass12float_e4m3_tEffLj2EEEvjjjPKjS4_S4_PT13_14CUtensorMap_stS7_S7_S7_S7_")
+             "N7cutlass12float_e4m3_tE13__nv_bfloat16fLj2EEEvjjjPKjS5_S5_PT13_14CUtensorMap_stS8_S8_S8_S8_")
 META_ENTRY = "_ZN9deep_gemm5sched25sm100_mqa_logits_metadataILj4ELj256ELj152ELj1ELj1ELj15EEEvjjPKjS3_Pj"
 TOPK = 2048
 TOPK_SMEM = 93408  # sizeof(Smem) of source/k31/k31_topk.cu
@@ -136,7 +136,7 @@ def meta_words(r):
 
 def indexer(j, r, kv_cap):
     """Interface: iq [., 32, 128] u8, kg [kv_cap, 128] u8, ksf [kv_cap] f32, w [., 32] f32, ks, ke u32,
-    zero, klen i32, logits f32, ind i32 [., 2048] out, then num_q, num_kv, stride, and the schedule
+    zero, klen i32, logits bf16, ind i32 [., 2048] out, then num_q, num_kv, stride, and the schedule
     [meta_words(r)] i32 out. Every row pointer is the call's, offset to the sub-chunk's first row; the
     logits and the schedule are the sub-chunk's own."""
     when = {"var": T, "min": j * r + 1}
@@ -148,15 +148,15 @@ def indexer(j, r, kv_cap):
                   params=["i32", "i32", "in buffer<u32>", "in buffer<u32>", "out buffer<i32>"],
                   args=[{"param": 10}, {"param": 11}, {"param": 4}, {"param": 5}, {"param": 13}], when=when, pdl=True)
     mqa = launch("glm_deepgemm", MQA_ENTRY, [SMS, 1, 1], [384, 1, 1], 220160,
-                 params=["i32", "i32", "i32", "in buffer<u32>", "in buffer<u32>", "in buffer<i32>", "out buffer<f32>",
+                 params=["i32", "i32", "i32", "in buffer<u32>", "in buffer<u32>", "in buffer<i32>", "out buffer<bf16>",
                          *["bytes<128>"] * 5],
                  args=[{"param": 10}, {"param": 11}, {"param": 12}, {"param": 4}, {"param": 5}, {"param": 13},
                        {"param": 8}, *maps], when=when, pdl=True)
-    topk = launch("k31_topk", "k31_topk", [{"clamp": [T, j * r, r]}, 1, 1], [512, 1, 1], TOPK_SMEM,
-                  params=["in buffer<f32>", "i32", "in buffer<i32>", "out buffer<i32>"],
-                  args=[{"param": 8}, {"param": 12}, {"param": 7}, {"param": 9}], when=when)
+    topk = launch("k31_topk", "k31_topk_held", [{"clamp": [T, j * r, r]}, 1, 1], [512, 1, 1], TOPK_SMEM,
+                  params=["in buffer<bf16>", "i32", "in buffer<i32>", "out buffer<i32>"],
+                  args=[{"param": 8}, {"param": 12}, {"param": 7}, {"param": 9}], when=when, pdl=True)
     return {"params": ["in buffer<u8>", "in buffer<u8>", "in buffer<f32>", "in buffer<f32>", "in buffer<u32>",
-                       "in buffer<u32>", "in buffer<i32>", "in buffer<i32>", "out buffer<f32>", "out buffer<i32>",
+                       "in buffer<u32>", "in buffer<i32>", "in buffer<i32>", "out buffer<bf16>", "out buffer<i32>",
                        "i32", "i32", "i32", "out buffer<i32>"],
             "impl": {"launches": [meta, mqa, topk]}}
 
