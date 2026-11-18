@@ -40,7 +40,7 @@ checkpoint (GLM-5.2-FP8 has the same tensors).
 |---|---|---|
 | `glm_deepgemm` | fp8 1d1d GEMMs (dense, m-grouped psum), bf16 batched GEMM (W_UK, W_UV), fp8 MQA logits | new upstream: DeepGEMM `ab69f76b`, MIT |
 | `glm_flashmla` | sparse MLA prefill, 64 heads, d_qk 576 | new upstream: FlashMLA `4f38f29e`, MIT |
-| `vllm_topk` | the indexer's top-2048 per row | new upstream: vLLM `f4edf9f0` `csrc/sampler.cu`, Apache-2.0 (`source/vllm-topk/`) |
+| `k31_topk` | the indexer's top-2048 per row: vLLM's set, ascending, the same bytes every run | from kern-k31 `c4a820a` (`source/k31/`) |
 | `glm_glue` | norms, quantization, rope, cache writes, row plan, MoE gather / combine | ours, after vLLM's GLM-5 math |
 | `glm_prep` | load-time UE8M0 re-quantization, kv_b split, the routed scaling fill | ours, after vLLM's `requant_weight_ue8m0` |
 | `k3_router_argmax+EXPERTS=256+TOPK=8` | router top-8, vocab argmax | rebuilt from K3 with new defines (`source/k3/README.md`) |
@@ -51,11 +51,10 @@ checkpoint (GLM-5.2-FP8 has the same tensors).
 ## Licenses
 
 Our sources (`source/glm_*.cu`, `scripts/`) are Apache-2.0 (`LICENSE`), as are those copied from
-kern-k3-pp-prefill (`source/k3/`). DeepGEMM and FlashMLA are git submodules under `third_party/` at
+kern-k3-pp-prefill (`source/k3/`) and kern-k31 (`source/k31/`). DeepGEMM and FlashMLA are git submodules under `third_party/` at
 the commits `kernels.toml` pins, MIT-licensed by DeepSeek (their own `LICENSE`); `source/glm_deepgemm.cu`
-and `source/glm_flashmla.cu` only instantiate their templates. vLLM's top-k is vendored with its
-Apache-2.0 license (`source/vllm-topk/`), FlashInfer's routing cubin with its own
-(`prebuilt/LICENSE.flashinfer`).
+and `source/glm_flashmla.cu` only instantiate their templates. FlashInfer's routing cubin carries its
+own license (`prebuilt/LICENSE.flashinfer`).
 
 `scripts/flashmla_probe.cu` records FlashMLA's launch parameter blocks without a GPU (upstream's host
 code run against stand-ins for the CUDA calls); `scripts/glm_ops.py` lays them out from that record.

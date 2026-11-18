@@ -100,10 +100,11 @@ def bf16_batched(n, k, rows, a, b, d, bn=256):
 
 
 # ---- the lightning indexer over one sub-chunk of R rows: DeepGEMM's fp8 MQA logits (compressed: row r's
-# logits at [r][0, ke - ks)) then vLLM's top-k of each row
+# logits at [r][0, ke - ks)) then each row's top-k (k31_topk: vLLM's set, ascending, the same bytes every run)
 MQA_ENTRY = ("_ZN9deep_gemm16sm100_mqa_logitsILj32ELj128ELb0ELb1ELb0ELb0ELj4ELj256ELj3ELj5ELj152ELj128ELj256E"
              "N7cutlass12float_e4m3_tEffLj2EEEvjjjPKjS4_S4_PT13_14CUtensorMap_stS7_S7_S7_S7_")
 TOPK = 2048
+TOPK_SMEM = 93408  # sizeof(Smem) of source/k31/k31_topk.cu
 
 
 def indexer(j, r, kv_cap):
@@ -120,11 +121,9 @@ def indexer(j, r, kv_cap):
                          *["bytes<128>"] * 5],
                  args=[{"param": 10}, {"param": 11}, {"param": 12}, {"param": 4}, {"param": 5}, {"i64": 0},
                        {"param": 8}, *maps], when=when, pdl=True)
-    topk = launch("vllm_topk", "glm_topk_prefill", [{"clamp": [T, j * r, r]}, 1, 1], [512, 1, 1], TOPK * 4,
-                  params=["in buffer<f32>", "in buffer<i32>", "in buffer<i32>", "out buffer<i32>", "i32", "i32",
-                          "i32", "i32"],
-                  args=[{"param": 8}, {"param": 6}, {"param": 7}, {"param": 9}, {"param": 12}, {"i32": 1},
-                        {"i32": TOPK}, {"i32": 0}], when=when)
+    topk = launch("k31_topk", "k31_topk", [{"clamp": [T, j * r, r]}, 1, 1], [512, 1, 1], TOPK_SMEM,
+                  params=["in buffer<f32>", "i32", "in buffer<i32>", "out buffer<i32>"],
+                  args=[{"param": 8}, {"param": 12}, {"param": 7}, {"param": 9}], when=when)
     return {"params": ["in buffer<u8>", "in buffer<u8>", "in buffer<f32>", "in buffer<f32>", "in buffer<u32>",
                        "in buffer<u32>", "in buffer<i32>", "in buffer<i32>", "out buffer<f32>", "out buffer<i32>",
                        "i32", "i32", "i32"],

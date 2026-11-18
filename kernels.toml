@@ -43,10 +43,10 @@ source = "source/glm_flashmla.cu"
 flags = "flashmla"
 includes = ["flashmla"]
 
-# vLLM's prefill top-k (source/vllm-topk/PROVENANCE.md).
-[kernels."vllm_topk"]
-sha256 = "93c8e8c6d5e51e8a06404689e33aac914b83d68a4fa4c5f241140411a712c327"
-source = "source/vllm-topk/topk.cu"
+# kern-k31's indexer top-k: vLLM's top-2048 set in ascending positions, deterministic (source/k31/README.md).
+[kernels."k31_topk"]
+sha256 = "104783b90d14f6b268a614dd9497743c027c57a0071762c7b9f39778ddba19ad"
+source = "source/k31/k31_topk.cu"
 
 [kernels."glm_glue"]
 sha256 = "03df8286b6fccefd864eb49549e74776efccabb93d09ebc8d80eb72debdcec2c"
