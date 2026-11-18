@@ -101,8 +101,9 @@ def within(op, lo, hi):
             ls.append({**l, "when": {"var": T, "min": a, "max": b}})
     return {**op, "impl": {**op["impl"], "launches": ls}}
 
-# the routed GEMMs' layout by row count (DeepGEMM's m-grouped choice: swap-AB, BN 128, a 2-CTA cluster)
-MOE_TILES = "16384:s128"
+# the routed GEMMs' layout by row count (DeepGEMM's m-grouped choice: swap-AB, BN 128, a 2-CTA cluster), block M
+# 256 once an expert averages more than 128 rows
+MOE_TILES = "4096:s128,16384:s256"
 # the dense GEMMs' layouts by row count, as moe_layouts reads them (s: swap-AB with that block M on a 2-CTA
 # cluster, n: that BN, m: BN 256 on a 2-CTA cluster multicasting the weight tile): at few rows each puts more
 # CTAs on its weight (fp8.o at 128 rows: 96 tiles of 128 weight rows x 64 tokens, not 24 of 128 x 256); from
@@ -119,7 +120,8 @@ def moe_layouts(spec, chunk):
     for part in spec.split(","):
         hi, cfg = part.split(":")
         hi = min(int(hi), chunk)
-        out.append(({"var": T, "min": lo, "max": hi}, int(cfg[1:]) if cfg[1:] else None))
+        if lo <= hi:
+            out.append(({"var": T, "min": lo, "max": hi}, int(cfg[1:]) if cfg[1:] else None))
         lo = hi + 1
     assert lo > chunk, "the MoE layouts cover every row count"
     return out

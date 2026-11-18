@@ -48,3 +48,4 @@ SGLang's prompt logprobs (its fp8-KV run), and against the checkpoint before.
 | 25 | 46ed875 | past 256 rows the v up-projection on a 2-CTA cluster sharing W_UV | 217.11 | 1001.01 | 247.85 | -0.19% | 598 | top-1 100.000% · flips 0 (confident 0) |
 | 26 | 572de46 | flash_mla's row-maximum barrier joins the four warps of a 32-head half | 216.75 | 999.46 | 247.44 | -0.16% | 598 | top-1 100.000% · flips 0 (confident 0) |
 | 27 | 299650f | indexer top-k writes its picks as stream rows itself, glm_topk_stream gone | 216.49 | 999.85 | 247.20 | -0.10% | 598 | top-1 100.000% · flips 0 (confident 0) |
+| 28 | b060a52 | above 4096 rows the routed GEMMs take block M 256 | 215.77 | 991.13 | 246.17 | -0.42% | 622 | top-1 100.000% · flips 0 (confident 0) |
