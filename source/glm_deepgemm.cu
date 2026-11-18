@@ -5,10 +5,12 @@
 //        (vLLM's DeepGEMM recipe for 128x128-block checkpoints), Normal and m-grouped contiguous
 //        over the 256 routed experts in the psum layout (only an expert's own row blocks run);
 //   bf16: batched bhr,hdr->bhd over the 64 heads, MLA's q absorption and v up-projection;
-//   mqa logits: the lightning indexer's fp8 scores, 32 heads of 128, compressed logits.
+//   mqa logits: the lightning indexer's fp8 scores, 32 heads of 128, compressed logits, its (q block, kv
+//        split) work spread evenly over the SMs by DeepGEMM's metadata kernel.
 #include <deep_gemm/impls/sm100_fp8_fp4_gemm_1d1d.cuh>
 #include <deep_gemm/impls/sm100_bf16_gemm.cuh>
 #include <deep_gemm/impls/sm100_mqa_logits.cuh>
+#include <deep_gemm/scheduler/sm100_mqa_logits_metadata.cuh>
 
 using namespace deep_gemm;
 using e4m3 = cutlass::float_e4m3_t;
@@ -58,7 +60,9 @@ void glm_instantiate() {
   GLM_FP8_SWAP(256, 6, 2, 256, 215040)
   GLM_BF16(128, 128, 6, 230400)
   GLM_BF16(128, 256, 4, 230400)
-  { auto p = reinterpret_cast<void*>(&sm100_mqa_logits<32, 128, false, true, false, false, 4, 256, 3, 5, 152,
+  { auto p = reinterpret_cast<void*>(&sm100_mqa_logits<32, 128, false, true, false, true, 4, 256, 3, 5, 152,
                                                        128, 256, e4m3, float, float>);
+    asm volatile("" ::"l"(p)); }
+  { auto p = reinterpret_cast<void*>(&sched::sm100_mqa_logits_metadata<4, 256, 152, 1, 1, 15>);
     asm volatile("" ::"l"(p)); }
 }

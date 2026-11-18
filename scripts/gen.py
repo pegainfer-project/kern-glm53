@@ -298,6 +298,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
     work("kg", [max_ctx, ID], "u8")
     work("ksf", [max_ctx], "f32")
     work("logits", [sub * max_ctx], "f32")
+    work("imeta", [G.meta_words(sub)], "i32")
     work("ind", [T, G.TOPK], "i32")
     if fp8kv:
         work("kvd", [max_ctx, MLA])
@@ -406,7 +407,8 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
                 step(f"{n}indexer.{j}", f"indexer.{j}", buf("iq", r0 * IQB), buf("kg"), buf("ksf"),
                      buf("wout", r0 * IH * 4), buf("ks", r0 * 4), buf("ke", r0 * 4), buf("zero", r0 * 4),
                      buf("klen", r0 * 4), buf("logits"), buf("ind", r0 * G.TOPK * 4),
-                     expr({"clamp": [T, r0, sub]}), var(CTX), expr({"mul": [{"ceil_div": [CTX, 256]}, 256]}))
+                     expr({"clamp": [T, r0, sub]}), var(CTX), expr({"mul": [{"ceil_div": [CTX, 256]}, 256]}),
+                     buf("imeta"))
             if fp8kv:
                 step(n + "topk_stream", "topk_stream", buf("ind"), buf("ks"), buf("klen"), buf("tlen"), var(T))
             else:
