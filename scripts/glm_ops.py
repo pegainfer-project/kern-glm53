@@ -113,6 +113,35 @@ def fp8_gemm(n, k, rows, lda, ldc, sfa_rows, groups=1, bn=None, swap_bm=None, mc
                   args=[*head, {"i32": n}, {"i32": k}, EPILOGUE, *maps], pdl=True, **extra), params
 
 
+GU_SILU_ENTRY = ("_ZN9deep_gemm20glm_moe_gu_silu_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj128ELj128ELj0ELj0ELj0ELj{bm}"
+                 "ELj128ELj128ELj{groups}ELj128ELj128ELj128ELj{stages}ELj2ELj128ELj128ELj2ELb1ELj152ELb1ELb0E"
+                 "LNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tES6_NS5_10bfloat16_tENS_8epilogue9transform"
+                 "16EpilogueIdentityEEEvPiPhSC_jjjT28_14CUtensorMap_stSE_SE_SE_SE_")
+SILU_SMEM = 512  # sizeof(glm::SiluSmem)
+
+
+def fp8_gu_silu(inter, k, rows, groups, bm, when=None):
+    """The routed gate-up GEMM (swap-AB at block M `bm`, BN 128, a 2-CTA cluster) with act = bf16(silu(gate) * up)
+    quantized per 128 columns in its epilogue (source/dg/glm_moe_gu_silu.cuh). Interface: a, w ([gate; up] of `inter`
+    rows each, a group apart), sfa, sfb, act [rows, inter] e4m3 out, its packed UE8M0 scales out, psum."""
+    n, kw = 2 * inter, k // 512
+    stages, smem = FP8_SWAP_TILE[bm]
+    maps = [desc(tm(0, 0, "u8", [k, rows], [k], [128, bm // 2], 128)),
+            desc(tm(0, 1, "u8", [k, n * groups], [k], [128, 64], 128)),
+            desc(tm(0, 2, "i32", [rows, kw], [rows * 4], [-(-bm // 128) * 128, 1])),
+            desc(tm(0, 3, "i32", [n, kw * groups], [n * 4], [64, 1])),
+            desc(tm(0, 4, "u8", [inter, rows], [inter], [64, 16]))]
+    l = launch("glm_deepgemm", GU_SILU_ENTRY.format(bm=bm, groups=groups, stages=stages), [SMS, 1, 1], [256, 1, 1],
+               smem + SILU_SMEM,
+               params=["in buffer<i32>", "out buffer<u8>", "out buffer<u8>", "i32", "i32", "i32", "bytes<24>",
+                       *["bytes<128>"] * 5],
+               args=[{"param": 6}, {"param": 4}, {"param": 5}, {"i32": rows}, {"i32": n}, {"i32": k}, EPILOGUE, *maps],
+               pdl=True, cluster=[2, 1, 1], **({"when": when} if when else {}))
+    params = ["in buffer<u8>", "in buffer<fp8e4m3>", "in buffer<u8>", "in buffer<u8>", "out buffer<u8>",
+              "out buffer<u8>", "in buffer<i32>"]
+    return l, params
+
+
 def fp8_op(*a, **kw):
     l, params = fp8_gemm(*a, **kw)
     return {"params": params, "impl": {"launches": [l]}}
