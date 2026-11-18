@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# loop/check CANDIDATE OUT [BASE]: kern test of a sub-model manifest (loop/gen's l11c.json) against BASE (default:
+# main's, $GLM_LOOP_DATA/base/l11c.json) on one leased GPU: every span replayed from A's inputs, the end-to-end
+# logits, the noise floor. Real text, 12000 tokens prefilled in 4096-row chunks: past the top-k's 2048, across
+# chunks and pages. Last line is the verdict: PASS / FAIL / INCONCLUSIVE.
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
+cand=$(realpath "$1") out=$(realpath -m "$2") base=$(realpath "${3:-$GLM_LOOP_DATA/base/l11c.json}")
+mkdir -p "$(dirname "$out")"
+# kern test diffs ops, not cubins: a module whose bytes changed under the same name would read as
+# "nothing to test". Renaming it in the candidate makes every op on it a changed implementation.
+python3 - "$base" "$cand" "$out.cand.json" <<'PY'
+import json, sys
+base, cand = (json.load(open(p)) for p in sys.argv[1:3])
+changed = {k for k, m in cand["modules"].items() if k in base["modules"] and base["modules"][k]["sha256"] != m["sha256"]}
+cand["modules"] = {(k + "+candidate" if k in changed else k): m for k, m in cand["modules"].items()}
+for op in cand["ops"].values():
+    for l in op["impl"]["launches"]:
+        if l.get("module") in changed:
+            l["module"] += "+candidate"
+json.dump(cand, open(sys.argv[3], "w"))
+print("modules changed in place:", ", ".join(sorted(changed)) or "none")
+PY
+cd "$LOOP_DIR"
+# kern test keeps every span's outputs in host memory (~180 GB here): at most two run on the host at once.
+slot() {
+  while :; do
+    for i in 0 1; do
+      exec {fd}>"$GLM_LOOP_DATA/check$i.lock"
+      flock -n "$fd" && return
+      exec {fd}>&-
+    done
+    sleep 7
+  done
+}
+slot
+test="env KERN_CACHE_DIR=$KERN_CACHE_DIR LD_LIBRARY_PATH=$LD_LIBRARY_PATH $GLM_KERN_BIN test --reference $base \
+--manifest $out.cand.json --kernels $REPO/build --weights $GLM_WEIGHTS --tokenizer $GLM_WEIGHTS/tokenizer.json --gpu 0 \
+--capacity 16384 --prefill 12000 --chunk 4096 --no-sweep --out $out.json"
+"$LOOP_DIR/withgpu" -n 1 bash -c "$test --prompt \"\$(cat $LOOP_DIR/prompt.txt)\" > $out.log 2>&1"
+rc=$?
+grep -E "logit|KL|flip|noise" "$out.log" | tail -8
+tail -n 1 "$out.log"
+exit $rc

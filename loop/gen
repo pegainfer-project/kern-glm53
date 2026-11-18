@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# loop/gen [OUT]: the sub-model every bench and check runs (default OUT loop/out): layers 0-10 and the head, one GPU.
+# OUT/l11.json has the serving manifest's bounds (16384 rows, 16 sequences, 1M context) for loop/bench;
+# OUT/l11c.json the same at 4096 rows and a 64k context, for loop/check (kern test keeps every span's outputs, and the
+# indexer's logits at 1M are 4 GB). Prints launches per layer.
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
+out=$(realpath -m "${1:-$LOOP_DIR/out}")
+mkdir -p "$out"
+gen() { PATH=$(dirname "$GLM_NVCC"):$PATH python3 "$REPO/scripts/gen.py" --layers 11 --cuts "" "$@"; }
+gen > "$out/l11.json"
+gen --chunk 4096 --max-ctx 65536 > "$out/l11c.json"
+for m in l11 l11c; do
+  "$GLM_KERN_BIN" verify "$out/$m.json" > "$out/$m.verify" 2>&1 || { cat "$out/$m.verify"; exit 1; }
+done
+"$LOOP_DIR/count" "$out/l11.json"

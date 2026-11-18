@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# loop/ab A B OUT [N]: A/B of two sub-model manifests on one leased GPU, A B B A A B ... N pairs (default 2), so both
+# sides see the same GPU, clocks and power cap. Writes OUT/{a,b}-<i>.{json,log}; prints each run's loop/score and
+# the per-scenario medians. Separate loop/bench calls can land on GPUs a few percent apart, more than most changes.
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
+a=$(realpath "$1") b=$(realpath "$2") out=$(realpath -m "$3") n=${4:-2}
+mkdir -p "$out"
+cd "$LOOP_DIR"
+bench="env KERN_CACHE_DIR=$KERN_CACHE_DIR LD_LIBRARY_PATH=$LD_LIBRARY_PATH $GLM_KERN_BIN bench --kernels $REPO/build \
+--weights $GLM_WEIGHTS --tokenizer $GLM_WEIGHTS/tokenizer.json --gpu 0 --workload $LOOP_DIR/workload.toml"
+runs=""
+for i in $(seq 1 "$n"); do
+  ra="$bench --manifest $a --out $out/a-$i.json > $out/a-$i.log 2>&1 && "
+  rb="$bench --manifest $b --out $out/b-$i.json > $out/b-$i.log 2>&1 && "
+  ((i % 2)) && runs+="$ra$rb" || runs+="$rb$ra"
+done
+"$LOOP_DIR/withgpu" -n 1 bash -c "${runs}true" || { echo "FAIL run (logs in $out)"; exit 1; }
+for i in $(seq 1 "$n"); do
+  echo "pair $i  A: $("$LOOP_DIR/score" "$out/a-$i.json")"
+  echo "pair $i  B: $("$LOOP_DIR/score" "$out/b-$i.json")"
+done
+python3 - "$out" "$n" "$LOOP_DIR" <<'PY'
+import json, statistics, sys
+sys.path.insert(0, sys.argv[3])
+out, n = sys.argv[1], int(sys.argv[2])
+import importlib.machinery, importlib.util
+spec = importlib.util.spec_from_loader("score", importlib.machinery.SourceFileLoader("score", sys.argv[3] + "/score"))
+score = importlib.util.module_from_spec(spec); spec.loader.exec_module(score)
+def side(s):
+    runs = [score.score(json.load(open(f"{out}/{s}-{i}.json"))) for i in range(1, n + 1)]
+    tot = {k: statistics.median(r[0][k] for r in runs) for k in runs[0][0]}
+    grid = {k: statistics.median(r[2][k][0] for r in runs) for k in runs[0][2]}
+    return tot, grid
+(ta, ga), (tb, gb) = side("a"), side("b")
+for k in ga:
+    print(f"{k:16s} A {ga[k]:9.2f}  B {gb[k]:9.2f}  {100 * (gb[k] / ga[k] - 1):+6.2f}%")
+print("median " + "  ".join(f"{k} {ta[k]:.2f} -> {tb[k]:.2f} ms ({100 * (tb[k] / ta[k] - 1):+.2f}%)" for k in ta))
+PY

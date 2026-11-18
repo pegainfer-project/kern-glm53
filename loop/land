@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# loop/land SHA "WHAT" [NOTE]: the orchestrator's merge of one agent commit into this checkout's main.
+#
+# Cherry-picks SHA without committing, builds (the pins must hold), generates the sub-model, A/Bs main's base
+# against it (loop/ab, two pairs) and runs the numerics gate against main (loop/longcheck). Prints both. Then,
+# only with LAND=1: appends the HISTORY.md row (main's commit it lands after, scores from the A/B's B side, Δ all against
+# the row above, launches, the gate's long line, NOTE) and commits the pick with SHA's message and author; main's base moves to it
+# (manifests, bench report, recordings). Without LAND=1 the pick is left staged for a look; `git reset --hard`
+# drops it.
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
+sha=$1 what=$2 note=${3:-}
+base=$GLM_LOOP_DATA/base
+cd "$REPO"
+[[ -z $(git status --porcelain --untracked-files=no) ]] || { echo "land: the tree is not clean" >&2; exit 1; }
+git cherry-pick -n "$sha"
+work=$GLM_LOOP_DATA/land/$sha
+mkdir -p "$work"
+"$LOOP_DIR/build" > "$work/build.log" 2>&1 || { tail -3 "$work/build.log"; exit 1; }
+"$LOOP_DIR/gen" "$work" | tee "$work/count.txt"
+"$LOOP_DIR/ab" "$base/l11.json" "$work/l11.json" "$work/ab" 2 | tee "$work/ab.txt"
+"$LOOP_DIR/longcheck" "$work/l11.json" "$work/lc" | tee "$work/lc.txt"
+[[ ${LAND:-0} == 1 ]] || { echo "land: staged, not committed (LAND=1 to commit)"; exit 0; }
+
+scores=$(python3 - "$work/ab" "$LOOP_DIR" <<'PY'
+import importlib.machinery, importlib.util, json, statistics, sys
+out, loop = sys.argv[1], sys.argv[2]
+spec = importlib.util.spec_from_loader("score", importlib.machinery.SourceFileLoader("score", loop + "/score"))
+sc = importlib.util.module_from_spec(spec); spec.loader.exec_module(sc)
+runs = [sc.score(json.load(open(f"{out}/b-{i}.json")))[0] for i in (1, 2)]
+print(" ".join(f"{statistics.median(r[k] for r in runs):.2f}" for k in ("short", "long", "all")))
+PY
+)
+read -r short long all <<<"$scores"
+prev=$(grep -E '^\| [0-9]+ \|' "$LOOP_DIR/HISTORY.md" | tail -n 1)
+n=$(($(cut -d'|' -f2 <<<"$prev") + 1))
+prev_all=$(cut -d'|' -f7 <<<"$prev" | tr -d ' ')
+delta=$(python3 -c "print(f'{100 * ($all / $prev_all - 1):+.2f}%')")
+launches=$(grep -oE '[0-9]+ launches' "$work/count.txt" | cut -d' ' -f1)
+gate=$(grep -E '^long ' "$work/lc.txt" | sed -E 's/^long +positions [0-9]+ · //; s/ · \|dlp\|.*//')
+author=$(git log -1 --format='%an' "$sha")
+parent=$(git rev-parse --short HEAD)
+echo "| $n | $parent | $what | $short | $long | $all | $delta | $launches | $gate${note:+; $note} |" >> "$LOOP_DIR/HISTORY.md"
+git add -A
+git commit -q -C "$sha" --signoff
+cp "$work/l11.json" "$work/l11c.json" "$base/"
+cp "$work/ab/b-1.json" "$base/bench-$n.json"
+rm -f "$base"/l11.json.long* "$base"/l11.json.short* "$base"/l11.json.log
+"$LOOP_DIR/longcheck" "$base/l11.json" "$work/rebase-rec" > /dev/null
+echo "land: $(git log -1 --format='%h %s') by $author · row $n · $short / $long / $all ms ($delta)"

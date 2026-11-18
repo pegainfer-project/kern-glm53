@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Teacher-forced prompt logits of the PP4 stages, one stage a GPU in one process (kern-py).
 
-    python3 scripts/kern_logits.py <stages dir> <kernels dir> <checkpoint> <prompts.json> <out.pt> [--chunks N]
+    python3 scripts/kern_logits.py <stages dir | manifest> <kernels dir> <checkpoint> <prompts.json> <out.pt> [--chunks N]
 
 prompts.json: {"name": [token ids]}. Each prompt runs through stage 0..3 (the residual stream copied from
-GPU to GPU between them) in --chunks equal chunks; after the last stage every row's logits are the head's
+GPU to GPU between them), or through the one manifest on GPU 0 (a sub-model from the embedding, loop/gen's),
+in --chunks equal chunks; after the last stage every row's logits are the head's
 math in torch (fused_add_rms_norm, then the f32 lm_head GEMM), and the last row's argmax is checked
 against the manifest's own `next_token`. Saved per prompt: top-8 logprobs and ids of every position.
 """
@@ -94,7 +95,7 @@ def call(stages, seqs):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("stages")
+    ap.add_argument("stages", help="a directory of stage{0..3}.json, or one manifest")
     ap.add_argument("kernels")
     ap.add_argument("ckpt")
     ap.add_argument("prompts")
@@ -103,8 +104,12 @@ def main():
     ap.add_argument("--pack", default="", help="comma-separated prompt names run packed into one call")
     a = ap.parse_args()
     # the runtime gives its pages all the memory free at load; what torch holds then stays torch's
-    reserve = [torch.empty((24 if g == 3 else 2) << 30, dtype=torch.uint8, device=f"cuda:{g}") for g in range(4)]
-    stages = [Stage(pathlib.Path(a.stages) / f"stage{s}.json", a.kernels, a.ckpt, s) for s in range(4)]
+    src = pathlib.Path(a.stages)
+    paths = [src / f"stage{s}.json" for s in range(4)] if src.is_dir() else [src]
+    last_gpu = len(paths) - 1
+    reserve = [torch.empty((24 if g == last_gpu else 2) << 30, dtype=torch.uint8, device=f"cuda:{g}")
+               for g in range(len(paths))]
+    stages = [Stage(p, a.kernels, a.ckpt, g) for g, p in enumerate(paths)]
     del reserve
     last = stages[-1]
     idx = json.load(open(pathlib.Path(a.ckpt) / "model.safetensors.index.json"))["weight_map"]

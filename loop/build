@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# loop/build [--update] [MODULE...]: every kernels.toml module into build/, checked against its pin
+# (--update repins what changed). Byte-identical in every worktree (scripts/build.py).
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
+cd "$REPO" && NVCC=$GLM_NVCC python3 scripts/build.py "$@"

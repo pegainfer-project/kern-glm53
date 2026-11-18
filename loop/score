@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""loop/score REPORT [--by-op]: the AgentX corpus's mean TTFT on idle PP4, in ms, from a kern bench of the
+11-layer sub-model (loop/gen) over loop/workload.toml.
+
+A scenario's time is projected to the 78-layer model: its graph time scaled by the weighted share of its
+calls, each layer standing for the full model's layers of its kind (dense: itself; MoE with an indexer:
+18 / 2; MoE sharing the picks: 57 / 6), the row plan for the four stages' plans. loop/weights.json turns
+the projected grid into the mean TTFT of each scenario: `short` (one chunk over the session's context),
+`long` (several chunks), and `all` (every request). Lower is better. --by-op splits `all` by op."""
+import json
+import pathlib
+import re
+import sys
+
+W = json.loads((pathlib.Path(__file__).resolve().parent / "weights.json").read_text())
+FULL = {0, 1, 2, 6, 10}
+
+
+def layer_weight(label):
+    if label.endswith(".plan"):
+        return 4.0
+    m = re.match(r"L(\d+)\.", label)
+    if not m:
+        return 1.0
+    l = int(m[1])
+    return 1.0 if l < 3 else 9.0 if l in FULL else 9.5
+
+
+def projected(s):
+    calls = [(c["label"], c["op"], c["in_program"]["stats"]["p50"]) for c in s["calls"] if c.get("in_program")]
+    raw = sum(t for _, _, t in calls)
+    scale = s["graph"]["stats"]["p50"] / raw / 1e3
+    by_op = {}
+    for label, op, t in calls:
+        by_op[op] = by_op.get(op, 0.0) + layer_weight(label) * t * scale
+    return sum(by_op.values()), by_op
+
+
+def score(report):
+    grid = {}
+    for s in report["scenarios"]:
+        sc = s["scenario"]
+        grid[f"r{sc['rows']}-kv{sc['context'][0]}"] = projected(s)
+    out, ops = {}, {}
+    total = sum(W["requests"].values())
+    for name, ws in W["weights"].items():
+        missing = [k for k in ws if k not in grid]
+        if missing:
+            raise SystemExit(f"report lacks {', '.join(missing)}")
+        out[name] = sum(w * grid[k][0] for k, w in ws.items()) / W["requests"][name]
+        for k, w in ws.items():
+            for op, t in grid[k][1].items():
+                ops[op] = ops.get(op, 0.0) + w * t / total
+    out["all"] = sum(out[n] * W["requests"][n] for n in W["weights"]) / total
+    return out, ops, grid
+
+
+def main():
+    report = json.loads(pathlib.Path(sys.argv[1]).read_text())
+    out, ops, grid = score(report)
+    print("score  " + "  ".join(f"{k} {v:.2f} ms" for k, v in out.items()))
+    if "--by-op" in sys.argv:
+        for op, t in sorted(ops.items(), key=lambda x: -x[1])[:25]:
+            print(f"  {op:28s} {t:9.3f} ms  {100 * t / out['all']:5.1f}%")
+    if "--grid" in sys.argv:
+        for k, (t, _) in grid.items():
+            print(f"  {k:16s} {t:9.2f} ms")
+
+
+if __name__ == "__main__":
+    main()

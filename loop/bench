@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# loop/bench MANIFEST OUT [kern bench flags, e.g. --ablate]: kern bench of the sub-model on one leased GPU over
+# loop/workload.toml; OUT.json (the report) and OUT.log. Prints each scenario's time and loop/score.
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
+m=$(realpath "$1") out=$(realpath -m "$2"); shift 2
+mkdir -p "$(dirname "$out")"
+cd "$LOOP_DIR"
+"$LOOP_DIR/withgpu" -n 1 env KERN_CACHE_DIR="$KERN_CACHE_DIR" LD_LIBRARY_PATH="$LD_LIBRARY_PATH" "$GLM_KERN_BIN" bench \
+  --manifest "$m" --kernels "$REPO/build" --weights "$GLM_WEIGHTS" --tokenizer "$GLM_WEIGHTS/tokenizer.json" --gpu 0 \
+  --workload "$LOOP_DIR/workload.toml" --out "$out.json" "$@" > "$out.log" 2>&1
+rc=$?
+grep -E "^(scenario|program)" "$out.log" | paste - - | awk '{printf "%-28s %s ms\n", $2, $4}'
+((rc == 0)) && "$LOOP_DIR/score" "$out.json"
+exit $rc

@@ -1,0 +1,6 @@
+Target: the indexer (`indexer.*`: DeepGEMM's fp8 MQA logits and the top-k; `idx_gather`, `q_post_full`'s indexer half, `weights_proj`): what makes a short chunk over a long context and a long chunk over any context pay for the whole context.
+
+- At 2048 rows over 128k the indexer is 35 ms of the projected 262 ms; at 16384 over 128k it is 306 of 1358. At 128-512 rows over 128k-1M a logits pass is far from its roofline (fp8 work of rows x ctx x 32 x 128 is tens of microseconds a layer at 128 rows), so the top-k's row-per-CTA parallelism and the f32 logits' round trip are the suspects; measure before choosing.
+- kern-k31 went the same way on the same indexer shape: bf16 logits on DeepGEMM 2.8's MQA logits (e1c8cf0, logits -37..-41%), a top-k over bf16 rows with pair compares (69d5583). The vendored `source/k31/k31_topk.cu` is its f32 top-k at c4a820a; its later revisions are in `$GLM_K31/source/k31_topk.cu`. The atlas lists split-row and fused logits+top-k kernels (`$GLM_ATLAS/topk/`, `$GLM_ATLAS/indexer_logits/`).
+- `--sub` (rows a call's indexer scores at once, logits sub x max-ctx) is a parameter: measure it.
+- Logits in bf16 are allowed. The top-k must stay deterministic (the bench checks it).

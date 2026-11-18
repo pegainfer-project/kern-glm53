@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# loop/fullcheck STAGES OUT [BASE]: the orchestrator's gate on the serving manifests. STAGES holds the PP4 stages at
+# their serving bounds (scripts/deploy.sh's out/p); the whole host is drained and leased, and scripts/kern_logits.py
+# teacher-forces $GLM_LOOP_DATA/prompts.json (six chat prompts, 300 to 12k tokens) through stage 0..3. Compared with
+# loop/logits_cmp.py against SGLang's own prompt logprobs ($GLM_SGLANG_REF, its fp8-KV run) and, given BASE (an
+# earlier OUT), against that.
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
+stages=$(realpath "$1") out=$(realpath -m "$2") base=${3:+$(realpath "$3")}
+mkdir -p "$(dirname "$out")"
+host=$(printf "${WITHGPU_HOST_FORMAT:-%s}" "${WITHGPU_HOSTS%% *}")
+locks=${WITHGPU_LOCKS:-/dev/shm/withgpu}
+ssh -o BatchMode=yes "$host" "mkdir -p $locks && touch $locks/drain"
+trap 'ssh -o BatchMode=yes "$host" "rm -f $locks/drain"' EXIT
+cmp="python3 $LOOP_DIR/logits_cmp.py $GLM_SGLANG_REF $out-c1.pt${base:+ && python3 $LOOP_DIR/logits_cmp.py $base-c1.pt $out-c1.pt}"
+"$LOOP_DIR/withgpu" -n 4 bash -c "docker run --rm --gpus all --ipc host --network none --entrypoint bash \
+  -u $(id -u):$(id -g) -e HOME=/tmp -e KERN_CACHE_DIR=$KERN_CACHE_DIR -v $KERN_CACHE_DIR:$KERN_CACHE_DIR \
+  -v $GLM_SHARED:$GLM_SHARED:ro -v $(dirname "$out"):$(dirname "$out") $GLM_TORCH_IMAGE \
+  -c 'pip install -q --no-deps --target /tmp/kp $GLM_KERN_WHEEL >/dev/null 2>&1 && export PYTHONPATH=/tmp/kp && \
+  python3 $REPO/scripts/kern_logits.py $stages $REPO/build $GLM_WEIGHTS $GLM_LOOP_DATA/prompts.json $out && $cmp'" \
+  > "$out.log" 2>&1
+rc=$?
+grep -E "^positions" "$out.log"
+exit $rc

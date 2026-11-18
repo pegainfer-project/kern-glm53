@@ -1,0 +1,8 @@
+# The bench grid loop/weights.json prices (loop/agentx.py): one sequence's chunk of `rows` over a `context`.
+samples = 12
+seed = 24301
+
+[[sweep]]
+groups = [1]
+chunk = [128, 512, 2048, 8192, 16384]
+context = [0, 65536, 131072, 196608, 262144]

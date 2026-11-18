@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# loop/longcheck CANDIDATE OUT [BASE]: the numerics gate. The sub-model at the serving bounds (loop/gen's l11.json, 1M
+# context) teacher-forced (scripts/kern_logits.py) on one leased GPU against BASE (default: main's,
+# $GLM_LOOP_DATA/base/l11.json, whose recordings are kept beside it), twice:
+#   long   262144 tokens of real text in sixteen 16384-row chunks, contexts 0 to 245760;
+#   short  six chat prompts (300 to 12000 tokens) in three chunks each, 100 to 4000 rows.
+# Prints loop/logits_cmp.py's line for each: top-1 agreement, |dlp|, flips and the confident ones, next_token.
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
+cand=$(realpath "$1") out=$(realpath -m "$2") base=$(realpath "${3:-$GLM_LOOP_DATA/base/l11.json}")
+mkdir -p "$(dirname "$out")"
+# in a container with torch (GLM_TORCH_IMAGE) on the leased GPU: kern_logits.py of MANIFEST over both prompt sets
+# into PREFIX.{long,short}, then any further command (the comparisons)
+run() {  # manifest, recording prefix, then a command
+  local m=$1 p=$2; shift 2
+  local kl="python3 $REPO/scripts/kern_logits.py $m $REPO/build $GLM_WEIGHTS"
+  "$LOOP_DIR/withgpu" -n 1 bash -c "docker run --rm --gpus device=\$CUDA_VISIBLE_DEVICES --ipc host --network none --entrypoint bash \
+    -u $(id -u):$(id -g) -e HOME=/tmp -e KERN_CACHE_DIR=$KERN_CACHE_DIR -v $KERN_CACHE_DIR:$KERN_CACHE_DIR -v $GLM_SHARED:$GLM_SHARED:ro -v $(dirname "$p"):$(dirname "$p") $GLM_TORCH_IMAGE \
+    -c 'pip install -q --no-deps --target /tmp/kp $GLM_KERN_WHEEL >/dev/null 2>&1 && export PYTHONPATH=/tmp/kp && \
+    $kl $GLM_LOOP_DATA/long.json $p.long --chunks 16 && $kl $GLM_LOOP_DATA/prompts.json $p.short --chunks 3 $*'" \
+    > "$p.log" 2>&1 || { tail -5 "$p.log"; exit 1; }
+}
+rec=$base
+if [[ ! -f $rec.short-c3.pt || $rec.short-c3.pt -ot $base ]]; then run "$base" "$rec"; fi
+cmp="python3 $LOOP_DIR/logits_cmp.py"
+run "$cand" "$out" "&& echo -n \"long   \" && $cmp $rec.long-c16.pt $out.long-c16.pt && echo -n \"short  \" && $cmp $rec.short-c3.pt $out.short-c3.pt"
+grep -E "^(long|short) " "$out.log"
