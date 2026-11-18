@@ -118,29 +118,32 @@ def fp8_gemm(n, k, rows, lda, ldc, sfa_rows, groups=1, bn=None, swap_bm=None, mc
 GU_SILU_ENTRY = ("_ZN9deep_gemm20glm_moe_gu_silu_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj128ELj128ELj0ELj0ELj0ELj{bm}"
                  "ELj128ELj128ELj{groups}ELj128ELj128ELj128ELj{stages}ELj2ELj128ELj128ELj2ELb1ELj152ELb1ELb0E"
                  "LNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tES6_NS5_10bfloat16_tENS_8epilogue9transform"
-                 "16EpilogueIdentityEEEvPiPhSC_jjjT28_14CUtensorMap_stSE_SE_SE_SE_")
-SILU_SMEM = 512  # sizeof(glm::SiluSmem)
+                 "16EpilogueIdentityEEEvPiPKiPKhPhSG_jjjT28_14CUtensorMap_stSI_SI_SI_SI_")
+SILU_SMEM = 576  # sizeof(glm::SiluSmem)
 
 
-def fp8_gu_silu(inter, k, rows, groups, bm, when=None):
-    """The routed gate-up GEMM (swap-AB at block M `bm`, BN 128, a 2-CTA cluster) with act = bf16(silu(gate) * up)
-    quantized per 128 columns in its epilogue (source/dg/glm_moe_gu_silu.cuh). Interface: a, w ([gate; up] of `inter`
-    rows each, a group apart), sfa, sfb, act [rows, inter] e4m3 out, its packed UE8M0 scales out, psum."""
+def fp8_gu_silu(inter, k, x_rows, rows, groups, bm, when=None):
+    """The routed gate-up GEMM (swap-AB at block M `bm`, BN 128, a 2-CTA cluster) over the tokens' rows, which a warp
+    of its own gathers through the routing's row table, with act = bf16(silu(gate) * up) quantized per 128 columns in
+    its epilogue (source/dg/glm_moe_gu_silu.cuh). Interface: x [x_rows, k] e4m3, w ([gate; up] of `inter` rows each, a group
+    apart), sfa (the routed rows' scales), sfb, act [rows, inter] e4m3 out, its packed UE8M0 scales out, psum,
+    the row table [rows]."""
     n, kw = 2 * inter, k // 512
     stages, smem = FP8_SWAP_TILE[bm]
-    maps = [desc(tm(0, 0, "u8", [k, rows], [k], [128, bm // 2], 128)),
+    maps = [desc(tm(0, 0, "u8", [k, x_rows], [k], [128, 1], 128)),
             desc(tm(0, 1, "u8", [k, n * groups], [k], [128, 64], 128)),
             desc(tm(0, 2, "i32", [rows, kw], [rows * 4], [-(-bm // 128) * 128, 1])),
             desc(tm(0, 3, "i32", [n, kw * groups], [n * 4], [64, 1])),
             desc(tm(0, 4, "u8", [inter, rows], [inter], [64, 16]))]
     l = launch("glm_deepgemm", GU_SILU_ENTRY.format(bm=bm, groups=groups, stages=stages), [SMS, 1, 1], [256, 1, 1],
                smem + SILU_SMEM,
-               params=["in buffer<i32>", "out buffer<u8>", "out buffer<u8>", "i32", "i32", "i32", "bytes<24>",
-                       *["bytes<128>"] * 5],
-               args=[{"param": 6}, {"param": 4}, {"param": 5}, {"i32": rows}, {"i32": n}, {"i32": k}, EPILOGUE, *maps],
+               params=["in buffer<i32>", "in buffer<i32>", "in buffer<u8>", "out buffer<u8>", "out buffer<u8>", "i32", "i32",
+                       "i32", "bytes<24>", *["bytes<128>"] * 5],
+               args=[{"param": 6}, {"param": 7}, {"param": 0}, {"param": 4}, {"param": 5}, {"i32": rows}, {"i32": n},
+                     {"i32": k}, EPILOGUE, *maps],
                pdl=True, cluster=[2, 1, 1], **({"when": when} if when else {}))
     params = ["in buffer<u8>", "in buffer<fp8e4m3>", "in buffer<u8>", "in buffer<u8>", "out buffer<u8>",
-              "out buffer<u8>", "in buffer<i32>"]
+              "out buffer<u8>", "in buffer<i32>", "in buffer<i32>"]
     return l, params
 
 
@@ -286,16 +289,21 @@ def flash_mla(rows, entry, kv):
 ROUTE_SLICE = 256
 
 
-def moe_route(experts, tiles):
+def moe_route(experts, tiles, x_rows, a_rows):
     """Interface: ids i32 [tokens, 8], hist i32 [slices, experts] (scratch), psum i32 [experts] out, exp2perm
-    i32 [tokens, 8] out, tokens. Expert e's rows start at its `tile`-aligned offset and end at psum[e]; routed row
-    (t, k) sits at exp2perm[t * 8 + k], an expert's rows in token order. `tiles`: [(when, tile)]."""
+    i32 [tokens, 8] out, tokens, rows i32 [a_rows] out, xsf (the tokens' packed scales, `x_rows` a word row) in,
+    asf (the routed rows', `a_rows` a word row) out. Expert e's rows start at its `tile`-aligned offset and end at
+    psum[e]; routed row (t, k) sits at p = exp2perm[t * 8 + k], an expert's rows in token order, rows[p] = t and
+    its scale words at p. `tiles`: [(when, tile)]."""
     grid = [{"ceil_div": [T, ROUTE_SLICE]}, 1, 1]
     count = launch("glm_moe", "glm_moe_count", grid, [ROUTE_SLICE, 1, 1],
                    params=["in buffer<i32>", "i32", "out buffer<i32>"], args=[{"param": 0}, {"param": 4}, {"param": 1}])
     place = [launch("glm_moe", "glm_moe_place", grid, [ROUTE_SLICE, 1, 1],
-                    params=["in buffer<i32>", "i32", "in buffer<i32>", "i32", "out buffer<i32>", "out buffer<i32>"],
-                    args=[{"param": 0}, {"param": 4}, {"param": 1}, {"i32": tile}, {"param": 2}, {"param": 3}],
+                    params=["in buffer<i32>", "i32", "in buffer<i32>", "i32", "out buffer<i32>", "out buffer<i32>",
+                            "out buffer<i32>", "in buffer<u8>", "i32", "out buffer<u8>", "i32"],
+                    args=[{"param": 0}, {"param": 4}, {"param": 1}, {"i32": tile}, {"param": 2}, {"param": 3},
+                          {"param": 5}, {"param": 6}, {"i32": x_rows}, {"param": 7}, {"i32": a_rows}],
                     **({"when": w} if len(tiles) > 1 else {})) for w, tile in tiles]
-    return {"params": ["in buffer<i32>", "out buffer<i32>", "out buffer<i32>", "out buffer<i32>", "i32"],
+    return {"params": ["in buffer<i32>", "out buffer<i32>", "out buffer<i32>", "out buffer<i32>", "i32",
+                       "out buffer<i32>", "in buffer<u8>", "out buffer<u8>"],
             "impl": {"launches": [count, *place]}}

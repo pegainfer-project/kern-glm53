@@ -1,9 +1,10 @@
 // GLM-5.3's routed gate-up GEMM with silu and the e4m3 quantization of its output in the epilogue:
 // DeepGEMM's sm100_fp8_fp4_gemm_1d1d_impl (third_party/DeepGEMM at the commit kernels.toml pins,
 // deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_gemm_1d1d.cuh, MIT, Copyright (c) 2025 DeepSeek),
-// copied and changed: the B and SFB loads take an n-block's 64 gate and 64 up rows, the swap-AB store
+// copied and changed: the A tile is gathered from the tokens' rows by an otherwise idle warp (cp.async by the
+// routing's row -> token table), the B and SFB loads take an n-block's 64 gate and 64 up rows, the swap-AB store
 // becomes glm::silu_store (upstream's bf16 staging, then silu, the quantization and global stores), and the
-// kernel takes the activation's and its scales' pointers. Everything else is upstream's.
+// kernel takes the row table's, the tokens', the activation's and its scales' pointers. Everything else is upstream's.
 #pragma once
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
@@ -38,9 +39,11 @@ namespace glm {
 
 constexpr uint32_t kSlots = 4;
 
-// A token's 64-column amax from the peer CTA, tagged with its chunk + 1 in the high word
+// A token's 64-column amax from the peer CTA, tagged with its chunk + 1 in the high word; per stage, the
+// barrier the gather warp's copies arrive on
 struct SiluSmem {
     uint64_t peer[kSlots][16];
+    uint64_t a_full[8];
 };
 
 // A chunk computed and sent, not yet stored: this thread's 8 act values and its token's amax
@@ -88,6 +91,13 @@ CUTLASS_DEVICE void silu8(const float (&g)[8], float (&s)[8]) {
         for (uint32_t k = 0; k < 8; ++ k)
             s[k] = g[k] / y[k];
     }
+}
+
+CUTLASS_DEVICE void wait_parity(uint64_t* bar, const uint32_t& parity) {
+    uint32_t done = 0;
+    while (not done)
+        asm volatile("{\n.reg .pred p;\nmbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;\nselp.u32 %0, 1, 0, p;\n}"
+                     : "=r"(done) : "r"(smem_u32(bar)), "r"(parity) : "memory");
 }
 
 CUTLASS_DEVICE uint64_t tagged(uint32_t chunk, float m) {
@@ -224,7 +234,7 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           typename a_dtype_t, typename b_dtype_t, typename cd_dtype_t,
           typename epilogue_op_t>
 CUTLASS_GLOBAL void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
-glm_moe_gu_silu_impl(int* grouped_layout, uint8_t* act_out, uint8_t* sf_out,
+glm_moe_gu_silu_impl(int* grouped_layout, const int* route, const uint8_t* a_rows, uint8_t* act_out, uint8_t* sf_out,
                              uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                              const __grid_constant__ epilogue_op_t epilogue_op,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_a,
@@ -366,6 +376,7 @@ glm_moe_gu_silu_impl(int* grouped_layout, uint8_t* act_out, uint8_t* sf_out,
             smem.empty_barriers[i].init(1);
             // Arrive only at the leader CTA
             smem.full_barriers[i].init(kNumMulticast * (1 + 32 * SF_BLOCK_K));
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 32;" :: "r"(glm::smem_u32(&silu.a_full[i])));
         }
         #pragma unroll
         for (uint32_t i = 0; i < kNumEpilogueStages; ++ i) {
@@ -409,8 +420,7 @@ glm_moe_gu_silu_impl(int* grouped_layout, uint8_t* act_out, uint8_t* sf_out,
     // Dispatch warps into different roles
     if (warp_idx == 0 and cute::elect_one_sync()) {
         // TMA load warp
-        constexpr uint32_t kNumTMABytesPerStage = LOAD_BLOCK_M * BLOCK_K / (kIsFP4A ? 2 : 1) +
-                                                  LOAD_BLOCK_N * BLOCK_K / (kIsFP4B ? 2 : 1);
+        DG_STATIC_ASSERT(not kIsFP4A and not kIsFP4B and kMajorA == cute::UMMA::Major::K, "e4m3 K-major operands");
 
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
@@ -475,13 +485,6 @@ glm_moe_gu_silu_impl(int* grouped_layout, uint8_t* act_out, uint8_t* sf_out,
                 }
                 smem.sf_full_barriers[stage_idx].arrive_and_expect_tx(sf_arrival_bytes);
 
-                // Issue A/B TMAs
-                if constexpr (kMajorA == cute::UMMA::Major::K)
-                    tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t, kIsBatchedMM>(
-                        &tensor_map_a, &smem.full_barriers[stage_idx], smem.a[stage_idx], k_a_idx, m_idx, kNumMulticast, batch_idx);
-                if constexpr (kMajorA == cute::UMMA::Major::MN)
-                    tma::copy<LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode, a_dtype_t, kIsBatchedMM>(
-                        &tensor_map_a, &smem.full_barriers[stage_idx], smem.a[stage_idx], m_idx, k_a_idx, kNumMulticast, batch_idx);
                 // The n-block's 64 gate rows, then its 64 up rows (shape_n / 2 further)
                 if constexpr (kMajorB == cute::UMMA::Major::K) {
                     const uint32_t gate_idx = n_idx - n_block_idx * BLOCK_N + n_block_idx * (BLOCK_N / 2);
@@ -497,7 +500,7 @@ glm_moe_gu_silu_impl(int* grouped_layout, uint8_t* act_out, uint8_t* sf_out,
 
                 // Arrive at full barriers
                 if (is_leader_cta) {
-                    smem.full_barriers[stage_idx].arrive_and_expect_tx(kNumTMABytesPerStage * kNumMulticast);
+                    smem.full_barriers[stage_idx].arrive_and_expect_tx(LOAD_BLOCK_N * BLOCK_K * kNumMulticast);
                 } else {
                     smem.full_barriers[stage_idx].arrive(0u);
                 }
@@ -693,10 +696,46 @@ glm_moe_gu_silu_impl(int* grouped_layout, uint8_t* act_out, uint8_t* sf_out,
                     for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i)
                         utccp_required_smem_warp_transpose(smem.sfb[stage_idx] + sf_k_subblock_idx * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
                 }
+                // The gather warp's A rows of this stage landed
+                glm::wait_parity(&silu.a_full[stage_idx], phase);
+
                 // TODO: figure out whether the proxy fence is valid for 2-CTA cases
                 cutlass::arch::fence_view_async_shared();
 
                 smem.full_barriers[stage_idx].arrive(0u);
+            }
+        }
+    } else if (warp_idx == 3) {
+        // A gather warp: this CTA's half of the block's token rows, straight from the tokens by the routing's row
+        // table, one 128 B row of a K block per 8 lanes (16 B a cp.async, the 128B swizzle by hand); each lane's
+        // copies of a stage arrive on silu.a_full, which the UTCCP warp waits before its full-barrier arrival.
+        DG_STATIC_ASSERT(SF_BLOCK_K == 1 and kMajorA == cute::UMMA::Major::K and BLOCK_K == 128 and kNumStages <= 8,
+                         "one SF warp, 128 B rows, a_full per stage");
+        constexpr uint32_t kRowsPerLane = LOAD_BLOCK_M / 4;
+        const uint32_t c = lane_idx % 8, r0 = lane_idx / 8;
+        while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+            const auto load_block_m = scheduler.get_aligned_effective_m_in_block(m_block_idx) / kNumMulticast;
+            const uint32_t p0 = m_block_idx * BLOCK_M + cute::block_rank_in_cluster() * load_block_m;
+            const uint32_t end = cute::min(scheduler.current_psum_m, p0 + load_block_m);
+            const uint8_t* src[kRowsPerLane];
+            #pragma unroll
+            for (uint32_t i = 0; i < kRowsPerLane; ++ i) {
+                const uint32_t p = p0 + r0 + i * 4;
+                src[i] = p < end ? a_rows + static_cast<size_t>(__ldg(route + p)) * shape_k + c * 16 : nullptr;
+            }
+            const auto num_total_k_blocks = math::ceil_div(shape_k, BLOCK_K);
+            for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
+                smem.empty_barriers[stage_idx].wait(phase ^ 1);
+                const uint32_t dst = glm::smem_u32(smem.a[stage_idx]);
+                #pragma unroll
+                for (uint32_t i = 0; i < kRowsPerLane; ++ i) {
+                    const uint32_t r = r0 + i * 4;
+                    if (src[i] != nullptr)
+                        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+                                     :: "r"(dst + r * 128 + ((c ^ (r % 8)) * 16)), "l"(src[i] + k_block_idx * BLOCK_K) : "memory");
+                }
+                asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];"
+                             :: "r"(glm::smem_u32(&silu.a_full[stage_idx])) : "memory");
             }
         }
     } else if (warp_idx >= kNumNonEpilogueThreads / 32 and warp_idx < (kNumNonEpilogueThreads + kNumUMMAStoreThreads) / 32) {

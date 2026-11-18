@@ -55,7 +55,7 @@ using bf16 = cutlass::bfloat16_t;
 
 // The routed gate-up GEMM at GLM_FP8_SWAP(BM, STAGES, 2, 256) with silu and e4m3 out (dg/glm_moe_gu_silu.cuh), its
 // glm::SiluSmem past the tile's 1024-aligned shared storage.
-static_assert(sizeof(glm::SiluSmem) == 512);
+static_assert(sizeof(glm::SiluSmem) == 576);
 #define GLM_FP8_GU_SILU(BM, STAGES, SMEM)                                                                \
   static_assert(SMEM % 1024 == 0);                                                                       \
   { auto p = reinterpret_cast<void*>(&glm_moe_gu_silu_impl<                                             \

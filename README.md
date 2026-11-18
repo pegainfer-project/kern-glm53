@@ -32,8 +32,8 @@ checkpoint (GLM-5.2-FP8 has the same tensors).
 - **Sparse attention at every length.** A row attends the top 2048 keys its indexer picked, and every
   key when its sequence has at most 2048, which is dense attention through the sparse kernel.
 - **MoE.** Routing tables over the router's top-8 (an expert's rows in token order), then DeepGEMM's
-  m-grouped fp8 GEMM in its psum layout, so only each expert's own row blocks run; the gate-up GEMM's
-  epilogue applies silu and quantizes the activation for the down GEMM.
+  m-grouped fp8 GEMM in its psum layout, so only each expert's own row blocks run; the gate-up GEMM gathers
+  its rows from the tokens itself, and its epilogue applies silu and quantizes the activation for the down GEMM.
 
 ## Kernels
 
@@ -44,8 +44,8 @@ checkpoint (GLM-5.2-FP8 has the same tensors).
 | `glm_vup` | MLA's v up-projection (W_UV) writing o_proj's e4m3 input and its UE8M0 scales | DeepGEMM `ab69f76b`'s bf16 batched GEMM with an epilogue of ours (`source/glm_vup.cu`) |
 | `glm_flashmla2` | sparse MLA prefill, 64 heads, d_qk 576, two softmax warpgroups | FlashMLA `4f38f29e`'s head64 kernel, modified (`source/flashmla_h64x2/`), MIT |
 | `glm_topk` | the indexer's top-2048 per row of bf16 logits: vLLM's set, ascending, the same bytes every run; a long row read once against its sample's threshold | ours, over kern-k31 `f4ddc91`'s `k31_topk` (`source/k31/`) |
-| `glm_glue` | norms, quantization, rope, cache writes, row plan, MoE gather / combine | ours, after vLLM's GLM-5 math |
-| `glm_moe` | MoE routing tables (the psum layout, each routed row's place) | ours |
+| `glm_glue` | norms, quantization, rope, cache writes, row plan, MoE combine | ours, after vLLM's GLM-5 math |
+| `glm_moe` | MoE routing tables (the psum layout, each routed row's place, token and scales) | ours |
 | `glm_prep` | load-time UE8M0 re-quantization, kv_b split, the routed scaling fill | ours, after vLLM's `requant_weight_ue8m0` |
 | `k3_router_argmax+EXPERTS=256+TOPK=8` | router top-8, vocab argmax | rebuilt from K3 with new defines (`source/k3/README.md`) |
 | `copy_rows` | each sequence's last row | reused from K3 |

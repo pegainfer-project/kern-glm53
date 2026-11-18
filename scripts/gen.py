@@ -180,10 +180,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
                         "impl": {"launches": [{**module("k3_router_argmax", EXPERTS=EXPERTS, TOPK=TOPK),
                                                "entry": "kern_k3_router_topk", "grid": [T, 1, 1],
                                                "block": [256, 1, 1]}]}},
-        "moe_route": G.moe_route(EXPERTS, [(w, bm or 128) for w, bm in layouts]),
-        "moe_gather": G.plain("glm_glue", "glm_moe_gather",
-                              ["in buffer<u8>", "in buffer<u8>", "i32", "in buffer<i32>", "out buffer<u8>",
-                               "out buffer<u8>", "i32"], [T, 1, 1], [384, 1, 1]),
+        "moe_route": G.moe_route(EXPERTS, [(w, bm or 128) for w, bm in layouts], chunk, mcap),
         "moe_combine": G.plain("glm_glue", "glm_moe_combine",
                                ["in buffer<bf16>", "in buffer<i32>", "in buffer<f32>", "in buffer<bf16>",
                                 "out buffer<bf16>", "i32"], [T, 1, 1], [256, 1, 1]),
@@ -233,7 +230,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
         "moe.gu": (2 * INTER, H, mcap, H, 2 * INTER, mcap, EXPERTS),
         "moe.dn": (H, INTER, mcap, INTER, H, mcap, EXPERTS),
     }
-    gu = [G.fp8_gu_silu(INTER, H, mcap, EXPERTS, bm or 128, when=w) for w, bm in layouts]
+    gu = [G.fp8_gu_silu(INTER, H, chunk, mcap, EXPERTS, bm or 128, when=w) for w, bm in layouts]
     ops["fp8.moe.gu"] = {"params": gu[0][1], "impl": {"launches": [l for l, _ in gu]}}
     del gemms["moe.gu"]
     for k, a in gemms.items():
@@ -348,7 +345,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
     work("exp2perm", [T, TOPK], "i32")
     work("psum", [EXPERTS], "i32")
     work("hist", [-(-chunk // G.ROUTE_SLICE), EXPERTS], "i32")
-    work("mq", [mcap, H], "u8")
+    work("rows", [mcap], "i32")
     work("msf", [sf_bytes(H, mcap)], "u8")
     work("mq2", [mcap, INTER], "u8")
     work("msf2", [sf_bytes(INTER, mcap)], "u8")
@@ -510,11 +507,10 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
         shared_expert(n, ".lane", lane=1, after=[0])
         step(n + "router", "gemm_f32", buf("xn"), buf(n + "w_r"), buf("rl"), var(T), i32(EXPERTS), i32(H), i32(EXPERTS))
         step(n + "topk", "router_topk", buf("rl"), buf(n + "bias"), buf("rs"), buf("ids"), buf("wts"), var(T))
-        step(n + "route", "moe_route", buf("ids"), buf("hist"), buf("psum"), buf("exp2perm"), var(T))
-        step(n + "gather", "moe_gather", buf("xq"), buf("xsf"), i32(chunk), buf("exp2perm"), buf("mq"), buf("msf"),
-             i32(mcap))
-        step(n + "fc1", "fp8.moe.gu", buf("mq"), buf(n + "w_13"), buf("msf"), buf(n + "w_13.sf"), buf("mq2"), buf("msf2"),
-             buf("psum"))
+        step(n + "route", "moe_route", buf("ids"), buf("hist"), buf("psum"), buf("exp2perm"), var(T), buf("rows"),
+             buf("xsf"), buf("msf"))
+        step(n + "fc1", "fp8.moe.gu", buf("xq"), buf(n + "w_13"), buf("msf"), buf(n + "w_13.sf"), buf("mq2"), buf("msf2"),
+             buf("psum"), buf("rows"))
         gemm(n + "fc2", "moe.dn", "mq2", n + "w_2", "f2", a_sf="msf2")
         shared_expert(n, "", after=[1])
         if fused(l):
