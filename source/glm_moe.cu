@@ -1,9 +1,9 @@
-// GLM-5.3's routing tables for the routed GEMMs' psum layout, from the router's top-8 ids, in two launches:
-// glm_moe_count tallies each slice of SLICE tokens' rows per expert, glm_moe_place lays the experts out
-// (expert e's rows from its `tile`-aligned offset, psum[e] its end) and puts row (t, k) at
-// p = exp2perm[t * 8 + k], an expert's rows in token order: rows[p] = t, the token the gate-up GEMM gathers,
-// and its activation's scale words at p. Every count is a popcount of a token bitmap: the same tables
-// every run.
+// GLM-5.3's routing tables for the MoE's grouped GEMMs' psum layout, from the router's top-8 ids, in two
+// launches: glm_moe_count tallies each slice of SLICE tokens' rows per expert, glm_moe_place lays the groups
+// out, the shared expert's T rows first (psum[0] = T), routed expert e's from its `tile`-aligned offset past
+// them (psum[e + 1] its end), and puts row (t, k) at p = exp2perm[t * 8 + k], an expert's rows in token
+// order: rows[p] = t, the token the gate-up GEMM gathers, and its activation's scale words at p (the shared
+// expert's row t is token t). Every count is a popcount of a token bitmap: the same tables every run.
 #include <stdint.h>
 
 #define EXPERTS 256
@@ -69,8 +69,9 @@ extern "C" __global__ void __launch_bounds__(SLICE) glm_moe_place(const int* __r
     base[e] += v;
     __syncthreads();
   }
-  const int start = (base[e] - blocks) * tile;
-  if (s == 0) psum[e] = start + count;
+  const int start = ((T + tile - 1) / tile + base[e] - blocks) * tile;
+  if (s == 0) psum[e + 1] = start + count;
+  if (s == 0 and e == 0) psum[0] = T;
   __syncthreads();
   base[e] = start + before;
 
@@ -96,6 +97,9 @@ extern "C" __global__ void __launch_bounds__(SLICE) glm_moe_place(const int* __r
   unsigned w[SF_WORDS];
 #pragma unroll
   for (int j = 0; j < SF_WORDS; ++j) w[j] = xsf[(size_t)j * x_rows + t];
+  rows_out[t] = t;
+#pragma unroll
+  for (int j = 0; j < SF_WORDS; ++j) asf[(size_t)j * a_rows + t] = w[j];
 #pragma unroll
   for (int k = 0; k < TOPK; ++k) {
     rows_out[out[k]] = t;

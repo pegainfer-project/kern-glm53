@@ -294,11 +294,12 @@ ROUTE_SLICE = 256
 
 
 def moe_route(experts, tiles, x_rows, a_rows):
-    """Interface: ids i32 [tokens, 8], hist i32 [slices, experts] (scratch), psum i32 [experts] out, exp2perm
+    """Interface: ids i32 [tokens, 8], hist i32 [slices, experts] (scratch), psum i32 [experts + 1] out, exp2perm
     i32 [tokens, 8] out, tokens, rows i32 [a_rows] out, xsf (the tokens' packed scales, `x_rows` a word row) in,
-    asf (the routed rows', `a_rows` a word row) out. Expert e's rows start at its `tile`-aligned offset and end at
-    psum[e]; routed row (t, k) sits at p = exp2perm[t * 8 + k], an expert's rows in token order, rows[p] = t and
-    its scale words at p. `tiles`: [(when, tile)]."""
+    asf (the grouped rows', `a_rows` a word row) out. Group 0, the shared expert, is rows [0, tokens) (psum[0]),
+    routed expert e's rows start at its `tile`-aligned offset past them and end at psum[e + 1]; routed row (t, k)
+    sits at p = exp2perm[t * 8 + k], an expert's rows in token order, rows[p] = t and its scale words at p.
+    `tiles`: [(when, tile)]."""
     grid = [{"ceil_div": [T, ROUTE_SLICE]}, 1, 1]
     count = launch("glm_moe", "glm_moe_count", grid, [ROUTE_SLICE, 1, 1],
                    params=["in buffer<i32>", "i32", "out buffer<i32>"], args=[{"param": 0}, {"param": 4}, {"param": 1}])

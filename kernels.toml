@@ -32,7 +32,7 @@ flashmla = ["third_party/FlashMLA/csrc", "third_party/FlashMLA/csrc/kerutils/inc
 # the indexer's fp8 MQA logits. Unmodified upstream templates, but for the routed gate-up GEMM's copy with the
 # silu epilogue (source/dg/, MIT, its provenance in the file's head).
 [kernels."glm_deepgemm"]
-sha256 = "509259cf131246385a942405cbd9986b0a7d0f42315db17bbc3e509ba1120f93"
+sha256 = "db2387580daea682bbcdf673c06855dc2d52123b8a85f2d8895b007e030773b1"
 source = "source/glm_deepgemm.cu"
 flags = "deepgemm"
 includes = ["deepgemm"]
@@ -64,7 +64,7 @@ sha256 = "b8723ad41eb73d0c0ec472e419db853f6dd405e18b2b2080272fa8e7ad261aa3"
 source = "source/glm_glue.cu"
 
 [kernels."glm_moe"]
-sha256 = "60f1c0a4921076dafcf9dd81ea0e8054e5dda622aa9b817dc072adbd4a2061df"
+sha256 = "3df73e64e6cf62bd37d1cba90fcbf1d760f382ef5778dd8c93b0f7ff4bc91527"
 source = "source/glm_moe.cu"
 
 [kernels."glm_prep"]

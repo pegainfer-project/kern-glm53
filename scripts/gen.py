@@ -22,10 +22,9 @@ A layer, as vLLM runs GLM-5 (DeepSeek V3.2's sparse attention) on Blackwell with
     does for a prefix (dequantize_k_cache_paged); --kv bf16 keeps [576] bf16 rows and attends in place;
   - the dense MLP (layers 0-2) or the MoE: sigmoid router with the score bias, top-8 of 256
     renormalized and scaled by 2.5, the routing tables (an expert's rows in token order), DeepGEMM's grouped fp8 GEMMs over
-    each expert's rows only, the shared expert, one f32 sum.
-Two branches run on lane 1 beside lane 0 (kern's program lanes): on a layer sharing the picks, the
-latent cache's lift (kv_dequant) beside its query chain from q_b to q_post, joined by the attention; up
-to 2048 rows, the shared expert beside the router and the routed experts, joined by the combine.
+    each expert's rows only, the shared expert their group 0 over every row, one f32 sum.
+On a layer sharing the picks, the latent cache's lift (kv_dequant) runs on lane 1 (kern's program lanes)
+beside its query chain from q_b to q_post, joined by the attention.
 Weights are the checkpoint's e4m3 tensors re-quantized to UE8M0 block scales while they load (the
 `derive` program, source/glm_prep.cu), the way vLLM prepares 128x128-block checkpoints for DeepGEMM
 on Blackwell.
@@ -58,6 +57,7 @@ IH, ID = 32, 128                       # indexer heads x dim
 QB = HEADS * (NOPE + ROPE)             # 16384
 IQB = IH * ID                          # 4096
 EXPERTS, TOPK, INTER, DENSE_I = 256, 8, 2048, 12288
+GROUPS = EXPERTS + 1                   # the grouped GEMMs': the shared expert, then the routed
 LAYERS, DENSE = 78, 3
 FULL = {0, 1, 2} | set(range(6, LAYERS, 4))  # config.json indexer_types == "full"
 PAGE = 64
@@ -85,22 +85,6 @@ def mla_entry():
     return entry
 
 
-# the shared expert's GEMMs by row count: BN 32 / 64 for few rows put 64-128 CTAs on the weight; from 1025 rows
-# the multicast tile (`m`, TILES below)
-SHARED_TILES = {"shared.gu": "256:n32,1024:n64,16384:m", "shared.dn": "256:n64,1024:n,16384:m"}
-LANE_ROWS = 2048  # the shared expert beside the routed path up to this many rows
-
-
-def within(op, lo, hi):
-    """`op` with its launches cut to row counts [lo, hi] (none outside it)."""
-    ls = []
-    for l in op["impl"]["launches"]:
-        w = l.get("when", {})
-        a, b = max(w.get("min", 1), lo), min(w.get("max", hi), hi)
-        if a <= b:
-            ls.append({**l, "when": {"var": T, "min": a, "max": b}})
-    return {**op, "impl": {**op["impl"], "launches": ls}}
-
 # the routed GEMMs' layout by row count (DeepGEMM's m-grouped choice: swap-AB, BN 128, a 2-CTA cluster), block M
 # 256 once an expert averages more than 128 rows
 MOE_TILES = "4096:s128,16384:s256"
@@ -108,7 +92,7 @@ MOE_TILES = "4096:s128,16384:s256"
 # cluster, n: that BN, m: BN 256 on a 2-CTA cluster multicasting the weight tile): at few rows each puts more
 # CTAs on its weight (fp8.o at 128 rows: 96 tiles of 128 weight rows x 64 tokens, not 24 of 128 x 256); from
 # 257 rows the multicast halves the L2 traffic of the weight tiles that bound the plain BN 256 tile
-TILES = {**SHARED_TILES, "o": "256:s64,16384:m", "dense.gu": "256:n,16384:m", "dense.dn": "512:s64,16384:m",
+TILES = {"o": "256:s64,16384:m", "dense.gu": "256:n,16384:m", "dense.dn": "512:s64,16384:m",
          "a.full": "256:n32,16384:n", "a.shared": "256:n32,16384:n", "b.full": "256:n,16384:m",
          "b.shared": "256:n128,16384:m"}
 
@@ -132,7 +116,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
     max_pages = max_ctx // PAGE
     layouts = moe_layouts(moe_tiles, chunk)
     tiles = [bm or 128 for _, bm in layouts]
-    mcap = TOPK * chunk + EXPERTS * max(tiles)   # routed rows, each expert's padded to its block M
+    mcap = (TOPK + 1) * chunk + GROUPS * max(tiles)   # the shared expert's rows and the routed, each group's padded
     kv0 = f"kv.{first}"
     head = first == 0 or layers == LAYERS
     fp8kv = kv_dtype == "fp8"
@@ -151,8 +135,6 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
         "silu_dense": G.nulled("glm_glue", "glm_silu_mul_quant",
                                ["in buffer<bf16>", "i32", "out buffer<u8>", "out buffer<u8>", "i32", "in buffer<i32>",
                                 "i32"], {5}, [{"mul": [T, DENSE_I // 1024]}, 1, 1], [256, 1, 1]),
-        "silu_shared": G.nulled("glm_glue", "glm_silu_rows", ["in buffer<bf16>", "in buffer<i32>", "out buffer<u8>",
-                                                             "out buffer<u8>", "i32"], {1}, [T, 1, 1], [256, 1, 1]),
         "q_post_full": G.plain("glm_glue", "glm_q_post",
                                ["in buffer<bf16>", "i32", "in buffer<bf16>", "in buffer<i32>", "inout buffer<bf16>",
                                 "out buffer<u8>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32"], [T, 1, 1], [256, 1, 1]),
@@ -225,12 +207,10 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
         "o": (H, HEADS * VD, chunk, HEADS * VD, H, chunk, 1),
         "dense.gu": (2 * DENSE_I, H, chunk, H, 2 * DENSE_I, chunk, 1),
         "dense.dn": (H, DENSE_I, chunk, DENSE_I, H, chunk, 1),
-        "shared.gu": (2 * INTER, H, chunk, H, 2 * INTER, chunk, 1),
-        "shared.dn": (H, INTER, chunk, INTER, H, chunk, 1),
-        "moe.gu": (2 * INTER, H, mcap, H, 2 * INTER, mcap, EXPERTS),
-        "moe.dn": (H, INTER, mcap, INTER, H, mcap, EXPERTS),
+        "moe.gu": (2 * INTER, H, mcap, H, 2 * INTER, mcap, GROUPS),
+        "moe.dn": (H, INTER, mcap, INTER, H, mcap, GROUPS),
     }
-    gu = [G.fp8_gu_silu(INTER, H, chunk, mcap, EXPERTS, bm or 128, when=w) for w, bm in layouts]
+    gu = [G.fp8_gu_silu(INTER, H, chunk, mcap, GROUPS, bm or 128, when=w) for w, bm in layouts]
     ops["fp8.moe.gu"] = {"params": gu[0][1], "impl": {"launches": [l for l, _ in gu]}}
     del gemms["moe.gu"]
     for k, a in gemms.items():
@@ -245,10 +225,6 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
             ops["fp8." + k] = {"params": ls[0][1], "impl": {"launches": [l for l, _ in ls]}}
         else:
             ops["fp8." + k] = G.fp8_op(*a)
-
-    for k in ("fp8.shared.gu", "fp8.shared.dn", "silu_shared"):
-        ops[k + ".lane"] = within(ops[k], 1, LANE_ROWS)
-        ops[k] = within(ops[k], LANE_ROWS + 1, chunk)
 
     requant_params = ["in buffer<fp8e4m3>", "in buffer<f32>", "out buffer<fp8e4m3>", "out buffer<u8>", "i32", "i32",
                       "i32", "i32", "i32", "i32", "i64"]
@@ -295,15 +271,17 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
         carry(name + ".sf", [sf_bytes(k, n)], "u8")
 
     def requant(dst, n_total, tensor, rows, k, row0=0, group_rows=None, groups=1, dst_group_rows=0, sf_group=0,
-                sf_ld=None):
-        """Checkpoint `tensor` (or one per group) into rows [row0, row0 + rows) of fp8 weight `dst`."""
+                sf_ld=None, dst_off=0, sf_off=0):
+        """Checkpoint `tensor` (or one per group) into rows [row0, row0 + rows) of fp8 weight `dst`, from byte
+        `dst_off` of it and `sf_off` of its scales."""
         src = f"{dst}.src.{len(derive.calls)}"
         names = [tensor] if isinstance(tensor, str) else tensor
         weight(src, [rows * groups, k], [seg(t + ".weight") for t in names], "fp8e4m3", "source")
         weight(src + ".s", [-(-rows // 128) * groups, k // 128], [seg(t + ".weight_scale_inv") for t in names], "f32",
                "source")
         derive.calls.append({"label": f"load.{src}", "op": requant_op(rows * groups, k),
-                             "args": [buf(src), buf(src + ".s"), buf(dst), buf(dst + ".sf"), i32(rows * groups), i32(k),
+                             "args": [buf(src), buf(src + ".s"), buf(dst, dst_off), buf(dst + ".sf", sf_off),
+                                      i32(rows * groups), i32(k),
                                       i32(group_rows or rows), i32(dst_group_rows), i32(row0), i32(sf_ld or n_total),
                                       i64(sf_group)]})
 
@@ -317,11 +295,11 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
     once.call("fill_bf16", [buf("rs"), i32(1), {"f32": 2.5}], 1)
 
     for name, w in (("res", H), ("h", H), ("xn", H), ("qa", NA[True]), ("qb", NB[True]), ("qmla", HEADS * MLA),
-                    ("o", HEADS * KVL), ("sg", 2 * INTER), ("sh", H), ("dg", 2 * DENSE_I)):
+                    ("o", HEADS * KVL), ("dg", 2 * DENSE_I)):
         work(name, [T, w])
-    for name, w in (("xq", H), ("qq", QL), ("iq", IQB), ("oq", HEADS * VD), ("sq", INTER), ("dq", DENSE_I)):
+    for name, w in (("xq", H), ("qq", QL), ("iq", IQB), ("oq", HEADS * VD), ("dq", DENSE_I)):
         work(name, [T, w], "u8")
-    for name, k in (("xsf", H), ("qsf", QL), ("osf", HEADS * VD), ("ssf", INTER), ("dsf", DENSE_I)):
+    for name, k in (("xsf", H), ("qsf", QL), ("osf", HEADS * VD), ("dsf", DENSE_I)):
         work(name, [sf_bytes(k, chunk)], "u8")
     for name in ("pos", "klen", "row_seq", "zero", "tlen"):
         work(name, [T], "i32")
@@ -343,7 +321,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
     work("ids", [T, TOPK], "i32")
     work("wts", [T, TOPK], "f32")
     work("exp2perm", [T, TOPK], "i32")
-    work("psum", [EXPERTS], "i32")
+    work("psum", [GROUPS], "i32")
     work("hist", [-(-chunk // G.ROUTE_SLICE), EXPERTS], "i32")
     work("rows", [mcap], "i32")
     work("msf", [sf_bytes(H, mcap)], "u8")
@@ -367,13 +345,6 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
         grouped = key.startswith("moe.")
         step(label, "fp8." + key, buf(a), buf(w), buf(a_sf), buf(w + ".sf"), buf(c), buf("psum") if grouped else m,
              **lanes)
-
-    def shared_expert(n, sfx, lane=0, after=None):
-        first = {"lane": lane, "after": after} if lane else {"after": after}
-        rest = {"lane": lane} if lane else {}
-        gemm(n + "sgu" + sfx, "shared.gu" + sfx, "xq", n + "w_sgu", "sg", **first)
-        step(n + "ssilu" + sfx, "silu_shared" + sfx, buf("sg"), buf("sq"), buf("ssf"), i32(chunk), **rest)
-        gemm(n + "sdn" + sfx, "shared.dn" + sfx, "sq", n + "w_sdn", "sh", a_sf="ssf", **rest)
 
     def plan(l):
         step(f"L{l}.plan", "plan", buf("cu_seqlens"), buf("seq_lens"), var(S), buf("pos"), buf("ks"), buf("ke"),
@@ -489,23 +460,21 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
             continue
         weight(n + "w_r", [EXPERTS, H], [seg(mlp + "gate.weight")])
         weight(n + "bias", [EXPERTS], [seg(mlp + "gate.e_score_correction_bias")], "f32")
-        fp8_weight(n + "w_13", EXPERTS * 2 * INTER, H)
+        # the grouped GEMMs' group 0 is the shared expert, expert e group e + 1
+        fp8_weight(n + "w_13", GROUPS * 2 * INTER, H)
+        requant(n + "w_13", 2 * INTER, mlp + "shared_experts.gate_proj", INTER, H)
+        requant(n + "w_13", 2 * INTER, mlp + "shared_experts.up_proj", INTER, H, row0=INTER)
         experts = lambda t: [f"{mlp}experts.{e}.{t}" for e in range(EXPERTS)]
+        sf13 = H // 512 * 2 * INTER
         for row0, t in ((0, "gate_proj"), (INTER, "up_proj")):
             requant(n + "w_13", 2 * INTER, experts(t), INTER, H, row0=row0, groups=EXPERTS, dst_group_rows=2 * INTER,
-                    sf_group=H // 512 * 2 * INTER)
-        fp8_weight(n + "w_2", EXPERTS * H, INTER)
-        requant(n + "w_2", H, experts("down_proj"), H, INTER, groups=EXPERTS, dst_group_rows=H,
-                sf_group=INTER // 512 * H)
-        fp8_weight(n + "w_sgu", 2 * INTER, H)
-        requant(n + "w_sgu", 2 * INTER, mlp + "shared_experts.gate_proj", INTER, H)
-        requant(n + "w_sgu", 2 * INTER, mlp + "shared_experts.up_proj", INTER, H, row0=INTER)
-        fp8_weight(n + "w_sdn", H, INTER)
-        requant(n + "w_sdn", H, mlp + "shared_experts.down_proj", H, INTER)
+                    sf_group=sf13, dst_off=2 * INTER * H, sf_off=4 * sf13)
+        fp8_weight(n + "w_2", GROUPS * H, INTER)
+        requant(n + "w_2", H, mlp + "shared_experts.down_proj", H, INTER)
+        sf2 = INTER // 512 * H
+        requant(n + "w_2", H, experts("down_proj"), H, INTER, groups=EXPERTS, dst_group_rows=H, sf_group=sf2,
+                dst_off=H * INTER, sf_off=4 * sf2)
 
-        # up to LANE_ROWS rows the shared expert runs on lane 1, beside the router, the routing and the routed GEMMs;
-        # past it the routed path fills the GPU on its own and the shared expert follows it on lane 0
-        shared_expert(n, ".lane", lane=1, after=[0])
         step(n + "router", "gemm_f32", buf("xn"), buf(n + "w_r"), buf("rl"), var(T), i32(EXPERTS), i32(H), i32(EXPERTS))
         step(n + "topk", "router_topk", buf("rl"), buf(n + "bias"), buf("rs"), buf("ids"), buf("wts"), var(T))
         step(n + "route", "moe_route", buf("ids"), buf("hist"), buf("psum"), buf("exp2perm"), var(T), buf("rows"),
@@ -513,12 +482,11 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
         step(n + "fc1", "fp8.moe.gu", buf("xq"), buf(n + "w_13"), buf("msf"), buf(n + "w_13.sf"), buf("mq2"), buf("msf2"),
              buf("psum"), buf("rows"))
         gemm(n + "fc2", "moe.dn", "mq2", n + "w_2", "f2", a_sf="msf2")
-        shared_expert(n, "", after=[1])
         if fused(l):
-            step(n + "combine", "combine_quant", buf("f2"), buf("exp2perm"), buf("wts"), buf("sh"), buf("res"),
+            step(n + "combine", "combine_quant", buf("f2"), buf("exp2perm"), buf("wts"), buf("f2"), buf("res"),
                  buf(f"L{l + 1}.gamma_in"), buf("xq"), buf("xsf"), i32(chunk), var(T))
         else:
-            step(n + "combine", "moe_combine", buf("f2"), buf("exp2perm"), buf("wts"), buf("sh"), buf("h"), var(T))
+            step(n + "combine", "moe_combine", buf("f2"), buf("exp2perm"), buf("wts"), buf("f2"), buf("h"), var(T))
 
     if head:
         step("head.h", "last_rows", buf("hl"), buf("h"), buf("cu_seqlens"), i32(H), i32(H))

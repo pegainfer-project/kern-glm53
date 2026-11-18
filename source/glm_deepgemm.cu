@@ -60,7 +60,7 @@ static_assert(sizeof(glm::SiluSmem) == 576);
 #define GLM_FP8_GU_SILU(BM, STAGES, SMEM)                                                                \
   static_assert(SMEM % 1024 == 0);                                                                       \
   { auto p = reinterpret_cast<void*>(&glm_moe_gu_silu_impl<                                             \
-        cute::UMMA::Major::K, cute::UMMA::Major::K, 128, 128, 128, 0, 0, 0, BM, 128, 128, 256,          \
+        cute::UMMA::Major::K, cute::UMMA::Major::K, 128, 128, 128, 0, 0, 0, BM, 128, 128, 257,          \
         128, 128, 128, STAGES, 2, 128, 128, 2, true, 152, true, false,                                   \
         GemmType::MGroupedContiguousWithPsumLayout, false, e4m3, e4m3, bf16,                            \
         epilogue::transform::EpilogueIdentity>);                                                        \
@@ -86,8 +86,8 @@ void glm_instantiate() {
   GLM_FP8_NARROW(64, 7, 128, 212992)
   GLM_FP8_SWAP(32, 11, 2, 256, 223232)
   GLM_FP8_SWAP(64, 10, 2, 256, 224256)
-  GLM_FP8_SWAP(128, 8, 2, 256, 214016)
-  GLM_FP8_SWAP(256, 6, 2, 256, 215040)
+  GLM_FP8_SWAP(128, 8, 2, 257, 214016)
+  GLM_FP8_SWAP(256, 6, 2, 257, 215040)
   GLM_FP8_GU_SILU(128, 8, 214016)
   GLM_FP8_GU_SILU(256, 6, 215040)
   GLM_BF16(128, 128, 6, 230400)
