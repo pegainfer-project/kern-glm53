@@ -132,10 +132,10 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
                             [{"mul": [T, TOPK]}, 1, 1], [256, 1, 1]),
         "q_post_full": G.plain("glm_glue", "glm_q_post",
                                ["in buffer<bf16>", "i32", "in buffer<bf16>", "in buffer<i32>", "inout buffer<bf16>",
-                                "out buffer<u8>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32"], [T, 1, 1], [256, 1, 1]),
+                                "out buffer<u8>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32"], [T, 1, 1], [256, 1, 1]),
         "q_post_shared": G.nulled("glm_glue", "glm_q_post",
                                   ["in buffer<bf16>", "i32", "in buffer<bf16>", "in buffer<i32>", "inout buffer<bf16>",
-                                   "out buffer<u8>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32"], {5, 6, 7},
+                                   "out buffer<u8>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32"], {5, 6, 7},
                                   [T, 1, 1], [256, 1, 1]),
         "idx_gather": G.plain("glm_glue", "glm_idx_gather",
                               ["in state", "in buffer<i32>", "i32", "in buffer<i32>", "i32", "out buffer<u8>",
@@ -299,7 +299,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
     for name in ("ks", "ke"):
         work(name, [T], "u32")
     work("iw", [T, IH])
-    work("wout", [T, IH], "f32")
+    work("wout", [T, IH])
     work("kg", [max_ctx, ID], "u8")
     work("ksf", [max_ctx], "f32")
     work("pick", [max_ctx], "u8")
@@ -411,7 +411,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
             for j in range(chunk // sub):
                 r0 = j * sub
                 step(f"{n}indexer.{j}", f"indexer.{j}", buf("iq", r0 * IQB), buf("kg"), buf("ksf"),
-                     buf("wout", r0 * IH * 4), buf("ks", r0 * 4), buf("ke", r0 * 4), buf("zero", r0 * 4),
+                     buf("wout", r0 * IH * 2), buf("ks", r0 * 4), buf("ke", r0 * 4), buf("zero", r0 * 4),
                      buf("klen", r0 * 4), buf("logits"), buf("ind", r0 * G.TOPK * 4),
                      expr({"clamp": [T, r0, sub]}), var(CTX), expr({"mul": [{"ceil_div": [CTX, 256]}, 256]}),
                      buf("imeta"))

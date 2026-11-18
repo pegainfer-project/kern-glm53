@@ -318,12 +318,12 @@ extern "C" __global__ void __launch_bounds__(256) glm_mla_prep_fp8(MLA_PREP_ARGS
 
 // After q_b: the rope of q_pe into the tail of the absorbed query qmla [T, 64, 576], and on full
 // layers the indexer query (rope on its first 64 dims, e4m3 per (row, head)) with its head weight
-// w = f32(iw) * scale * 128^-0.5 * 32^-0.5. qb [T, ldb]: 64 heads of nope 192 | pe 64, then the
+// w = bf16(f32(iw) * scale * 128^-0.5 * 32^-0.5). qb [T, ldb]: 64 heads of nope 192 | pe 64, then the
 // indexer's 32 heads of 128 at column 16384.
 //   grid (T), block 256
 extern "C" __global__ void __launch_bounds__(256) glm_q_post(
     const bf16* __restrict__ qb, int ldb, const bf16* __restrict__ rope, const int* __restrict__ pos,
-    bf16* __restrict__ qmla, u8* __restrict__ iq, const bf16* __restrict__ iw, float* __restrict__ wout, int full,
+    bf16* __restrict__ qmla, u8* __restrict__ iq, const bf16* __restrict__ iw, bf16* __restrict__ wout, int full,
     int T) {
   const int r = blockIdx.x, t = threadIdx.x, w = t >> 5, l = t & 31;
   const bf16* row = qb + (size_t)r * ldb;
@@ -370,7 +370,7 @@ extern "C" __global__ void __launch_bounds__(256) glm_q_post(
       x *= sc;
       x *= 0.08838834764831845f;
       x *= 0.17677669529663687f;
-      wout[(size_t)r * IH + ih] = x;
+      wout[(size_t)r * IH + ih] = __float2bfloat16(x);
     }
   }
 }
