@@ -33,7 +33,15 @@ namespace sm100::prefill::sparse_fwd::head64x2 {
 
 using namespace cute;
 
-// get_s_from_p's exponentials and S, the float2 sums left to the caller
+// ex2.approx.ftz: exp2f as FlashMLA's own build (--use_fast_math) runs it, without the subnormal-result fix-up
+CUTE_DEVICE
+float exp2_ftz(float x) {
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+// get_s_from_p's exponentials (ex2.approx.ftz) and S, the float2 sums left to the caller
 template<int NUM_ELEMS_PER_THREAD>
 CUTE_DEVICE
 void get_s_d_from_p(
@@ -48,8 +56,8 @@ void get_s_d_from_p(
     CUTE_UNROLL
     for (int i = 0; i < NUM_ELEMS_PER_THREAD/2; i += 1) {
         d[i] = ku::float2_fma(float2{p[i*2], p[i*2+1]}, scale_float2, neg_new_max_float2);
-        d[i].x = exp2f(d[i].x);
-        d[i].y = exp2f(d[i].y);
+        d[i].x = exp2_ftz(d[i].x);
+        d[i].y = exp2_ftz(d[i].y);
         s[i] = __float22bfloat162_rn(d[i]);
     }
 }

@@ -23,4 +23,9 @@ warpgroup (512 threads): thread (lane quadrant q, group g) holds head (q & 1) * 
   `fma(li, scale, x + y)`; group 1 adds its pair's `li` and writes the epilogue. `setmaxnreg`: softmax
   groups 200, the others 56.
 
-The products, the exponentials, S, `li` and the outputs are upstream's, bit for bit.
+- The exponentials of S are `ex2.approx.ftz` (`exp2_ftz`), as FlashMLA's own build (`--use_fast_math`) runs
+  them; this build has no fast math, and `exp2f` added a subnormal-result fix-up (a compare, two predicated
+  multiplies) to every one.
+
+The products, S, `li` and the outputs are upstream's, bit for bit; an exponential whose result would be
+subnormal (below 2^-126) is 0 here.
