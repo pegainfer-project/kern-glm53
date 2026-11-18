@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # loop/land SHA "WHAT" [NOTE]: the orchestrator's merge of one agent commit into this checkout's main.
 #
-# Cherry-picks SHA without committing (a conflict only in kernels.toml takes SHA's side), builds and repins, generates the sub-model, A/Bs main's base
+# Cherry-picks SHA without committing (a conflict only in kernels.toml takes SHA's side hunk by hunk), builds and repins, generates the sub-model, A/Bs main's base
 # against it (loop/ab, two pairs) and runs the numerics gate against main (loop/longcheck). Prints both. Then,
 # only with LAND=1 and the gate passing (all lower, short and long not up beyond 0.3%, longcheck inside
 # TASK.md's floor): appends the HISTORY.md row (main's commit it lands after, the row above times the A/B's B/A ratio per scenario,
@@ -14,10 +14,14 @@ sha=$1 what=$2 note=${3:-}
 base=$GLM_LOOP_DATA/base
 cd "$REPO"
 [[ -z $(git status --porcelain --untracked-files=no) ]] || { echo "land: the tree is not clean" >&2; exit 1; }
-# kernels.toml's pins were the agent's main's; the build repins them on this main (the bench and the gate judge it)
+# kernels.toml's pins were the agent's main's; a conflict there takes SHA's side of each conflicting hunk only
+# (main's other entries stay), and the build repins on this main (the bench and the gate judge it)
 git cherry-pick -n "$sha" || {
   [[ $(git diff --name-only --diff-filter=U) == kernels.toml ]] || { echo "land: conflicts beyond kernels.toml" >&2; exit 1; }
-  git checkout --theirs kernels.toml && git add kernels.toml
+  t=$(mktemp -d)
+  for i in 1 2 3; do git show ":$i:kernels.toml" > "$t/$i"; done
+  git merge-file --theirs "$t/2" "$t/1" "$t/3" && cp "$t/2" kernels.toml && git add kernels.toml
+  rm -rf "$t"
 }
 work=$GLM_LOOP_DATA/land/$sha
 mkdir -p "$work"
