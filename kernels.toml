@@ -44,12 +44,13 @@ source = "source/glm_vup.cu"
 flags = "deepgemm"
 includes = ["deepgemm"]
 
-# FlashMLA sm100 sparse prefill, head 64, d_qk 576. Unmodified upstream instantiation.
-[kernels."glm_flashmla"]
-sha256 = "7f19c223c47d3cf50e2fae42f2edca5f4adbbc155894a600f279fbf3548036f2"
-source = "source/glm_flashmla.cu"
+# FlashMLA's sm100 head64 sparse prefill with two softmax warpgroups (source/flashmla_h64x2/, MIT).
+[kernels."glm_flashmla2"]
+sha256 = "7b2181325ad1f1f427b4d2350261213cabb2ca89981f50eaf293dc898822f3b9"
+source = "source/glm_flashmla2.cu"
 flags = "flashmla"
 includes = ["flashmla"]
+defines = { GLM_SMEM = 231728 }
 
 # kern-k31's indexer top-k: vLLM's top-2048 set in ascending positions, deterministic (source/k31/README.md).
 [kernels."k31_topk"]

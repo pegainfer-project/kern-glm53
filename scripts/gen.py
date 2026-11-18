@@ -77,7 +77,7 @@ sf_bytes = lambda k, rows: k // 512 * rows * 4  # DeepGEMM's packed UE8M0 words,
 
 
 def mla_entry():
-    cubin = pathlib.Path(__file__).resolve().parents[1] / "build" / "glm_flashmla.cubin"
+    cubin = pathlib.Path(__file__).resolve().parents[1] / "build" / "glm_flashmla2.cubin"
     out = subprocess.run(["cuobjdump", "-elf", str(cubin)], capture_output=True, text=True, check=True).stdout
     names = [l.split()[0][len(".text."):] for l in out.splitlines() if l.startswith(".text.")]
     (entry,) = [n for n in names if "sparse_attn_fwd_kernel" in n]

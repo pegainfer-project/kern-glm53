@@ -4,7 +4,7 @@
 # by the checkout's kern.
 #   <out>/glm53.json         the whole model
 #   <out>/p/stage{0..3}.json the stages
-# Needs build/glm_flashmla.cubin (scripts/build.py) for the attention's entry name.
+# Needs build/glm_flashmla2.cubin (scripts/build.py) for the attention's entry name.
 set -euo pipefail
 kern=$(realpath "$1") out=$(realpath -m "$2")
 shift 2

@@ -39,7 +39,7 @@ checkpoint (GLM-5.2-FP8 has the same tensors).
 | module | what | provenance |
 |---|---|---|
 | `glm_deepgemm` | fp8 1d1d GEMMs (dense, m-grouped psum), bf16 batched GEMM (W_UK, W_UV), fp8 MQA logits (bf16 out) and its schedule | new upstream: DeepGEMM `ab69f76b`, MIT |
-| `glm_flashmla` | sparse MLA prefill, 64 heads, d_qk 576 | new upstream: FlashMLA `4f38f29e`, MIT |
+| `glm_flashmla2` | sparse MLA prefill, 64 heads, d_qk 576, two softmax warpgroups | FlashMLA `4f38f29e`'s head64 kernel, modified (`source/flashmla_h64x2/`), MIT |
 | `k31_topk` | the indexer's top-2048 per row of bf16 logits: vLLM's set, ascending, the same bytes every run | from kern-k31 `f4ddc91` (`source/k31/`) |
 | `glm_glue` | norms, quantization, rope, cache writes, row plan, MoE gather / combine | ours, after vLLM's GLM-5 math |
 | `glm_moe` | MoE routing tables (the psum layout, each routed row's place) | ours |
@@ -53,7 +53,8 @@ checkpoint (GLM-5.2-FP8 has the same tensors).
 Our sources (`source/glm_*.cu`, `scripts/`) are Apache-2.0 (`LICENSE`), as are those copied from
 kern-k3-pp-prefill (`source/k3/`) and kern-k31 (`source/k31/`). DeepGEMM and FlashMLA are git submodules under `third_party/` at
 the commits `kernels.toml` pins, MIT-licensed by DeepSeek (their own `LICENSE`); `source/glm_deepgemm.cu`
-and `source/glm_flashmla.cu` only instantiate their templates.
+only instantiates their templates; `source/flashmla_h64x2/` is FlashMLA's head64 prefill modified (its README
+says how), under FlashMLA's MIT license.
 
 `scripts/flashmla_probe.cu` records FlashMLA's launch parameter blocks without a GPU (upstream's host
 code run against stand-ins for the CUDA calls); `scripts/glm_ops.py` lays them out from that record.

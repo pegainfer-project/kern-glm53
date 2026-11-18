@@ -217,7 +217,7 @@ def flash_mla(rows, entry, kv):
         tm(0x480, 2, "bf16", [512, 0], [1152], [64, 1], 128, 256)]}}
     return {"params": ["in buffer<bf16>", "in buffer<bf16>", kv, "in buffer<i32>", "in buffer<i32>",
                        "out buffer<bf16>", "out buffer<f32>", "out buffer<f32>"],
-            "impl": {"launches": [launch("glm_flashmla", entry, [T, 1, 1], [384, 1, 1], 230704,
+            "impl": {"launches": [launch("glm_flashmla2", entry, [T, 1, 1], [512, 1, 1], 231728,
                                          params=["bytes<144>", "bytes<1280>"], args=[params, tma])]}}
 
 
