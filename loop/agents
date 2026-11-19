@@ -50,6 +50,7 @@ resume() {
   container_up
   deadline=$(date -u -d "+$(python3 -c "print(round($hours * 60))") minutes" +%FT%T)
   sed -i -E "s/^\*\*Deadline: [^*]+ UTC\*\*/**Deadline: $deadline UTC**/" "$dir/ROUND.md"
+  stop "$name"
   printf 'budget:\n  hours: %s\n' "$hours" > "$dir/.budget.yaml"
   agent_env > "$dir/loop/local.env.new" && mv "$dir/loop/local.env.new" "$dir/loop/local.env"
   tell "$name" "${3:-Restarted (outside cause, not yours).} Your branch, work/ and notes are as you left them; check notes/$name.md and git log, then carry on. Main has moved: rebase first."
@@ -72,6 +73,7 @@ paths() {
 up() {
   local name=$1 hours=$2 roundfile=$3 dir=$runs/$1
   container_up
+  stop "$name"
   [[ -d $clone ]] || { git clone -q "$REPO" "$clone" && git -C "$clone" checkout -q --detach; }
   git -C "$clone" fetch -q "$REPO" main:main
   git -C "$clone" config user.name "$(git -C "$REPO" config user.name)"
@@ -88,6 +90,7 @@ up() {
     paths
     printf '\n## Messages from the orchestrator\n\nRe-read this section at the start of every session; new ones are added here.\n'
     tail -n +2 "$roundfile"; } > "$dir/ROUND.md"
+  stop "$name"
   printf 'budget:\n  hours: %s\n' "$hours" > "$dir/.budget.yaml"
   agent_env > "$dir/loop/local.env.new" && mv "$dir/loop/local.env.new" "$dir/loop/local.env"
   local ex; ex=$(git -C "$dir" rev-parse --git-path info/exclude)
@@ -112,12 +115,21 @@ down() {
   for w in $(tmux list-windows -t $session -F '#W' 2>/dev/null | grep -vx main); do
     [[ -z ${1:-} || $w == "$1" ]] && tmux kill-window -t "$session:$w"
   done
-  # Killing a window leaves its docker exec child running, so the agent is stopped in the container too.
   if [[ -n ${1:-} ]]; then
-    docker exec $container pkill -u "$(id -u)" -f "runs/$1/.budget" 2>/dev/null || true
+    stop "$1"
   else
     docker exec $container pkill -u "$(id -u)" -f 'hmz exec|claude' 2>/dev/null || true
   fi
+}
+
+# Killing a window leaves its docker exec child running: an agent's ralph_loop and its claude session are stopped
+# in the container too, or a restart runs two sessions in one worktree
+stop() {
+  local p
+  for p in $(docker exec $container pgrep -u "$(id -u)" -f "ralph_loop -c $runs/$1/.budget" 2>/dev/null); do
+    docker exec $container pkill -P "$p" 2>/dev/null || true
+    docker exec $container kill "$p" 2>/dev/null || true
+  done
 }
 
 status() {
