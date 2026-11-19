@@ -2,7 +2,7 @@
 # loop/agents: the orchestrator's side of the overnight loop.
 #
 #   loop/agents up NAME HOURS ROUNDFILE   start (or restart) agent NAME
-#   loop/agents resume NAME HOURS         restart NAME in place: its branch, notes and messages kept, a new deadline
+#   loop/agents resume NAME HOURS [WHY]   restart NAME in place: its branch, notes and messages kept, a new deadline
 #   loop/agents tell NAME MESSAGE         append a message to its ROUND.md
 #   loop/agents down [NAME]               stop one agent, or all
 #   loop/agents sync                      move the clone's main to this checkout's
@@ -45,7 +45,7 @@ resume() {
   deadline=$(date -u -d "+$(python3 -c "print(round($hours * 60))") minutes" +%FT%T)
   sed -i -E "s/^\*\*Deadline: [^*]+ UTC\*\*/**Deadline: $deadline UTC**/" "$dir/ROUND.md"
   printf 'budget:\n  hours: %s\n' "$hours" > "$dir/.budget.yaml"
-  tell "$name" "Restarted after the session was killed at 20:58 UTC (outside cause, not yours). Your branch, work/ and notes are as you left them; check notes/$name.md and git log, then carry on. Main has moved: rebase first."
+  tell "$name" "${3:-Restarted (outside cause, not yours).} Your branch, work/ and notes are as you left them; check notes/$name.md and git log, then carry on. Main has moved: rebase first."
   window "$name" "docker exec -it -w $dir $container \
     hmz exec -f ralph_loop -c $dir/.budget.yaml -a $spec \"\$(cat $dir/loop/TASK.md $dir/ROUND.md)\"; exec bash"
 }
