@@ -34,3 +34,14 @@ is that A/B's. Numerics are `loop/longcheck`'s long pass against the row above.
 | 22 | dfd2f45 | MoE combine takes the next layer's input norm when that layer shares the picks | 218.04 | 1004.71 | 248.88 | -0.15% | 579 | top-1 100.000% · flips 0 (confident 0) |
 | 23 | 1a76317 | past 1024 rows the shared expert's GEMMs take the multicast tile | 217.53 | 1004.22 | 248.37 | -0.20% | 587 | top-1 100.000% · flips 0 (confident 0) |
 | 24 | 4f3c271 | o_proj adds into the residual stream, norm_post reads res alone | 217.51 | 1003.12 | 248.31 | -0.03% | 587 | top-1 100.000% · flips 0 (confident 0) |
+
+## 78-layer checkpoints
+
+`loop/fullcheck`: the PP4 serving stages teacher-forced over six chat prompts (24300 positions) against
+SGLang's prompt logprobs (its fp8-KV run), and against the checkpoint before.
+
+| main | vs SGLang: top-1 / confident flips / \|dlp\| mean | vs the checkpoint before |
+|---|---|---|
+| row 0 | 95.222% / 10 / 0.0555 | |
+| row 7 (`ff9ecc7`) | 95.198% / 11 / 0.0555 | 98.374% / 1 |
+| row 7 + idx's bf16 head sum (row 10's commit) | 95.276% / 10 / 0.0556 | 98.309% / 1 |

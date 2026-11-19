@@ -39,13 +39,11 @@ checkpoint (GLM-5.2-FP8 has the same tensors).
 
 | module | what | provenance |
 |---|---|---|
-| `glm_deepgemm` | fp8 1d1d GEMMs (dense, m-grouped psum), bf16 batched GEMM (W_UK, W_UV), fp8 MQA logits (bf16 out) and its schedule | new upstream: DeepGEMM `ab69f76b`, MIT |
-| `glm_flashmla2` | sparse MLA prefill, 64 heads, d_qk 576, two softmax warpgroups | FlashMLA `4f38f29e`'s head64 kernel, modified (`source/flashmla_h64x2/`), MIT |
-| `glm_fp8_tiles` | the fp8 1d1d Normal GEMM in swap-AB on a 2-CTA cluster, the projections at few rows | new upstream: DeepGEMM `ab69f76b`, MIT |
+| `glm_deepgemm` | fp8 1d1d GEMMs (dense, m-grouped psum; the routed gate-up's copy with a silu epilogue, `source/dg/`), bf16 batched GEMM (W_UK), fp8 MQA logits (bf16 out) and its schedule | new upstream: DeepGEMM `ab69f76b`, MIT |
 | `glm_fp8_tiles` | the fp8 1d1d Normal GEMM in swap-AB on a 2-CTA cluster (the projections at few rows) and BN 256 on a 2-CTA cluster multicasting the weight (from a few hundred rows) | new upstream: DeepGEMM `ab69f76b`, MIT |
-| `glm_deepgemm` | fp8 1d1d GEMMs (dense, m-grouped psum; the routed gate-up's copy with a silu epilogue, `source/dg/`), bf16 batched GEMM (W_UK, W_UV), fp8 MQA logits (bf16 out) and its schedule | new upstream: DeepGEMM `ab69f76b`, MIT |
-| `glm_flashmla` | sparse MLA prefill, 64 heads, d_qk 576 | new upstream: FlashMLA `4f38f29e`, MIT |
-| `k31_topk` | the indexer's top-2048 per row of bf16 logits: vLLM's set, ascending, the same bytes every run | from kern-k31 `f4ddc91` (`source/k31/`) |
+| `glm_vup` | MLA's v up-projection (W_UV) writing o_proj's e4m3 input and its UE8M0 scales | DeepGEMM `ab69f76b`'s bf16 batched GEMM with an epilogue of ours (`source/glm_vup.cu`) |
+| `glm_flashmla2` | sparse MLA prefill, 64 heads, d_qk 576, two softmax warpgroups | FlashMLA `4f38f29e`'s head64 kernel, modified (`source/flashmla_h64x2/`), MIT |
+| `glm_topk` | the indexer's top-2048 per row of bf16 logits: vLLM's set, ascending, the same bytes every run; a long row read once against its sample's threshold | ours, over kern-k31 `f4ddc91`'s `k31_topk` (`source/k31/`) |
 | `glm_glue` | norms, quantization, rope, cache writes, row plan, MoE gather / combine | ours, after vLLM's GLM-5 math |
 | `glm_moe` | MoE routing tables (the psum layout, each routed row's place) | ours |
 | `glm_prep` | load-time UE8M0 re-quantization, kv_b split, the routed scaling fill | ours, after vLLM's `requant_weight_ue8m0` |
