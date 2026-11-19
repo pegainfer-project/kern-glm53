@@ -2,7 +2,8 @@
 // DeepGEMM's sm100_fp8_fp4_gemm_1d1d_impl (third_party/DeepGEMM at the commit kernels.toml pins,
 // deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_gemm_1d1d.cuh, MIT, Copyright (c) 2025 DeepSeek),
 // copied and changed: the A tile is gathered from the tokens' rows by an otherwise idle warp (cp.async by the
-// routing's row -> token table), the B and SFB loads take an n-block's 64 gate and 64 up rows, the swap-AB store
+// routing's row -> token table), the B and SFB loads take an n-block's 64 gate and 64 up rows (B from tile-major
+// weights, a box one 8 KB tile), the swap-AB store
 // becomes glm::silu_store (upstream's bf16 staging, then silu, the quantization and global stores), and the
 // kernel takes the row table's, the tokens', the activation's and its scales' pointers. Everything else is upstream's.
 #pragma once
@@ -485,14 +486,18 @@ glm_moe_gu_silu_impl(int* grouped_layout, const int* route, const uint8_t* a_row
                 }
                 smem.sf_full_barriers[stage_idx].arrive_and_expect_tx(sf_arrival_bytes);
 
-                // The n-block's 64 gate rows, then its 64 up rows (shape_n / 2 further)
+                // The n-block's 64 gate rows, then its 64 up rows (shape_n / 2 further), each one tile of the
+                // tile-major weights: (row / 64) * (K / 128) + K block
                 if constexpr (kMajorB == cute::UMMA::Major::K) {
+                    DG_STATIC_ASSERT(LOAD_BLOCK_N == 128 and BLOCK_K == 128 and kNumMulticast == 2, "64-row x 128-byte tiles");
                     const uint32_t gate_idx = n_idx - n_block_idx * BLOCK_N + n_block_idx * (BLOCK_N / 2);
-                    tma::copy<BLOCK_K, LOAD_BLOCK_N / 2, kSwizzleBMode, b_dtype_t, kIsBatchedMM>(
-                        &tensor_map_b, &smem.full_barriers[stage_idx], smem.b[stage_idx], k_b_idx, gate_idx, kNumMulticast, batch_idx);
-                    tma::copy<BLOCK_K, LOAD_BLOCK_N / 2, kSwizzleBMode, b_dtype_t, kIsBatchedMM>(
-                        &tensor_map_b, &smem.full_barriers[stage_idx], smem.b[stage_idx] + LOAD_BLOCK_N / 2 * BLOCK_K,
-                        k_b_idx, gate_idx + shape_n / 2, kNumMulticast, batch_idx);
+                    const uint32_t kbs = shape_k / BLOCK_K;
+                    #pragma unroll
+                    for (uint32_t h = 0; h < 2; ++ h)
+                        cute::SM100_TMA_2SM_LOAD_3D::copy(&tensor_map_b, reinterpret_cast<uint64_t*>(&smem.full_barriers[stage_idx]),
+                                                          static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
+                                                          smem.b[stage_idx] + h * (LOAD_BLOCK_N / 2) * BLOCK_K, 0, 0,
+                                                          static_cast<int>((gate_idx + h * shape_n / 2) / 64 * kbs + k_block_idx));
                 }
                 if constexpr (kMajorB == cute::UMMA::Major::MN)
                     tma::copy<LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode, b_dtype_t, kIsBatchedMM>(

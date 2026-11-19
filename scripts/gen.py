@@ -163,7 +163,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
                                                "entry": "kern_k3_router_topk", "grid": [T, 1, 1],
                                                "block": [256, 1, 1]}]}},
         "moe_route": G.moe_route(EXPERTS, [(w, bm or 128) for w, bm in layouts], chunk, mcap, H // 512),
-        "moe_combine": G.plain("glm_glue", "glm_moe_combine",
+        "moe_combine": G.plain("glm_moe", "glm_moe_combine",
                                ["in buffer<bf16>", "in buffer<i32>", "in buffer<f32>", "in buffer<bf16>",
                                 "out buffer<bf16>", "i32"], [T, 1, 1], [256, 1, 1]),
         "combine_quant": G.plain("glm_glue", "glm_combine_quant",
@@ -215,7 +215,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
     del gemms["moe.gu"]
     for k, a in gemms.items():
         if k.startswith("moe."):
-            ls = [G.fp8_gemm(*a, swap_bm=bm, when=w) for w, bm in layouts]
+            ls = [G.fp8_gemm(*a, swap_bm=bm, when=w, tiled=True) for w, bm in layouts]
             ops["fp8." + k] = {"params": ls[0][1], "impl": {"launches": [l for l, _ in ls]}}
         elif k in TILES:
             kinds = [part.split(":")[1][:1] for part in TILES[k].split(",")]
@@ -229,10 +229,10 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
     requant_params = ["in buffer<fp8e4m3>", "in buffer<f32>", "out buffer<fp8e4m3>", "out buffer<u8>", "i32", "i32",
                       "i32", "i32", "i32", "i32", "i64"]
 
-    def requant_op(rows, k):
-        name = f"requant.{rows}x{k}"
-        ops.setdefault(name, G.plain("glm_prep", "glm_requant", requant_params, [-(-rows // 128), k // 128, 1],
-                                     [256, 1, 1]))
+    def requant_op(rows, k, tiled=False):
+        name = f"requant{'_tiled' if tiled else ''}.{rows}x{k}"
+        entry = ("glm_moe", "glm_requant_tiled") if tiled else ("glm_prep", "glm_requant")
+        ops.setdefault(name, G.plain(*entry, requant_params, [-(-rows // 128), k // 128, 1], [256, 1, 1]))
         return name
 
     ops["kvb"] = G.plain("glm_prep", "glm_kvb", ["in buffer<fp8e4m3>", "in buffer<f32>", "out buffer<bf16>",
@@ -271,7 +271,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
         carry(name + ".sf", [sf_bytes(k, n)], "u8")
 
     def requant(dst, n_total, tensor, rows, k, row0=0, group_rows=None, groups=1, dst_group_rows=0, sf_group=0,
-                sf_ld=None, dst_off=0, sf_off=0):
+                sf_ld=None, dst_off=0, sf_off=0, tiled=False):
         """Checkpoint `tensor` (or one per group) into rows [row0, row0 + rows) of fp8 weight `dst`, from byte
         `dst_off` of it and `sf_off` of its scales."""
         src = f"{dst}.src.{len(derive.calls)}"
@@ -279,7 +279,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
         weight(src, [rows * groups, k], [seg(t + ".weight") for t in names], "fp8e4m3", "source")
         weight(src + ".s", [-(-rows // 128) * groups, k // 128], [seg(t + ".weight_scale_inv") for t in names], "f32",
                "source")
-        derive.calls.append({"label": f"load.{src}", "op": requant_op(rows * groups, k),
+        derive.calls.append({"label": f"load.{src}", "op": requant_op(rows * groups, k, tiled),
                              "args": [buf(src), buf(src + ".s"), buf(dst, dst_off), buf(dst + ".sf", sf_off),
                                       i32(rows * groups), i32(k),
                                       i32(group_rows or rows), i32(dst_group_rows), i32(row0), i32(sf_ld or n_total),
@@ -460,20 +460,20 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
             continue
         weight(n + "w_r", [EXPERTS, H], [seg(mlp + "gate.weight")])
         weight(n + "bias", [EXPERTS], [seg(mlp + "gate.e_score_correction_bias")], "f32")
-        # the grouped GEMMs' group 0 is the shared expert, expert e group e + 1
+        # the grouped GEMMs' group 0 is the shared expert, expert e group e + 1; their weights tile-major
         fp8_weight(n + "w_13", GROUPS * 2 * INTER, H)
-        requant(n + "w_13", 2 * INTER, mlp + "shared_experts.gate_proj", INTER, H)
-        requant(n + "w_13", 2 * INTER, mlp + "shared_experts.up_proj", INTER, H, row0=INTER)
+        requant(n + "w_13", 2 * INTER, mlp + "shared_experts.gate_proj", INTER, H, tiled=True)
+        requant(n + "w_13", 2 * INTER, mlp + "shared_experts.up_proj", INTER, H, row0=INTER, tiled=True)
         experts = lambda t: [f"{mlp}experts.{e}.{t}" for e in range(EXPERTS)]
         sf13 = H // 512 * 2 * INTER
         for row0, t in ((0, "gate_proj"), (INTER, "up_proj")):
             requant(n + "w_13", 2 * INTER, experts(t), INTER, H, row0=row0, groups=EXPERTS, dst_group_rows=2 * INTER,
-                    sf_group=sf13, dst_off=2 * INTER * H, sf_off=4 * sf13)
+                    sf_group=sf13, dst_off=2 * INTER * H, sf_off=4 * sf13, tiled=True)
         fp8_weight(n + "w_2", GROUPS * H, INTER)
-        requant(n + "w_2", H, mlp + "shared_experts.down_proj", H, INTER)
+        requant(n + "w_2", H, mlp + "shared_experts.down_proj", H, INTER, tiled=True)
         sf2 = INTER // 512 * H
         requant(n + "w_2", H, experts("down_proj"), H, INTER, groups=EXPERTS, dst_group_rows=H, sf_group=sf2,
-                dst_off=H * INTER, sf_off=4 * sf2)
+                dst_off=H * INTER, sf_off=4 * sf2, tiled=True)
 
         step(n + "router", "gemm_f32", buf("xn"), buf(n + "w_r"), buf("rl"), var(T), i32(EXPERTS), i32(H), i32(EXPERTS))
         step(n + "topk", "router_topk", buf("rl"), buf(n + "bias"), buf("rs"), buf("ids"), buf("wts"), var(T))

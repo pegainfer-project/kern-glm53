@@ -65,12 +65,14 @@ FP8_ENTRY = ("_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0EL
              "16EpilogueIdentityEEEvPijjjT28_14CUtensorMap_stSD_SD_SD_SD_")
 
 
-def fp8_gemm(n, k, rows, lda, ldc, sfa_rows, groups=1, bn=None, swap_bm=None, mcb=False, acc=False, when=None):
+def fp8_gemm(n, k, rows, lda, ldc, sfa_rows, groups=1, bn=None, swap_bm=None, mcb=False, acc=False, when=None,
+             tiled=False):
     """C[m, :n] (rows ldc apart) = A[m, :k] (lda apart) . W[n, k]^T with both operands' block scales.
     Interface: a, w, sfa, sfb, c, then m (dense) or the psum offsets of `groups` experts (grouped:
     expert g's rows end at psum[g] and start at the previous end rounded up to the block M, its weight
     rows at g * n, its scale words at g * k / 512). The tensor maps span `rows` rows of A and C.
-    `swap_bm`: swap-AB with that block M (grouped: the psum alignment), BN 128, a 2-CTA cluster.
+    `swap_bm`: swap-AB with that block M (grouped: the psum alignment), BN 128, a 2-CTA cluster; `tiled` with it
+    (grouped): W tile-major (glm_requant_tiled's 64-row x 128-byte tiles), source/dg/glm_moe_dn.cuh's copy.
     `mcb`: BN 256 on a 2-CTA cluster along M multicasting the weight tile (source/glm_fp8_tiles.cu); the
     pair needs an even count of 128-row blocks (DeepGEMM's multicast legality), so it runs m rounded up to
     256 rows, its extra rows inside the `rows` the maps span and read by no one.
@@ -93,11 +95,15 @@ def fp8_gemm(n, k, rows, lda, ldc, sfa_rows, groups=1, bn=None, swap_bm=None, mc
         a_box, sfa_box, cd_box = [128, 128], [128, 1], [swz // 2, 128]
     entry = FP8_ENTRY.format(bm=bm, bn=bn, groups=groups, stages=stages, mc=mc, mca=int(not mcb), swap=int(bool(swap_bm)), swz=swz, acc=int(acc),
                              gemm=5 if grouped else 0)
+    assert not tiled or (swap_bm and grouped), "tile-major weights only on the grouped swap-AB copy"
+    if tiled:
+        entry = entry.replace("28sm100_fp8_fp4_gemm_1d1d_impl", "15glm_moe_dn_impl")
     params = ["in buffer<u8>", "in buffer<fp8e4m3>", "in buffer<u8>", "in buffer<u8>",
               "inout buffer<bf16>" if acc else "out buffer<bf16>",
               "in buffer<i32>" if grouped else "i32"]
     maps = [desc(tm(0, 0, "u8", [k, rows], [lda], a_box, 128)),
-            desc(tm(0, 1, "u8", [k, n * groups], [k], [128, bn // 2 if mcb else bn], 128)),
+            desc(tm(0, 1, "u8", [128, 64, n * groups // 64 * (k // 128)], [128, 8192], [128, 64, 1], 128) if tiled else
+                 tm(0, 1, "u8", [k, n * groups], [k], [128, bn // 2 if mcb else bn], 128)),
             desc(tm(0, 2, "i32", [sfa_rows, kw], [sfa_rows * 4], sfa_box)),
             desc(tm(0, 3, "i32", [n, kw * groups], [n * 4], [max(bn, 128), 1])),
             desc(tm(0, 4, "bf16", [n, rows], [ldc * 2], cd_box, swz))]
@@ -131,7 +137,7 @@ def fp8_gu_silu(inter, k, x_rows, rows, groups, bm, when=None):
     n, kw = 2 * inter, k // 512
     stages, smem = FP8_SWAP_TILE[bm]
     maps = [desc(tm(0, 0, "u8", [k, x_rows], [k], [128, 1], 128)),
-            desc(tm(0, 1, "u8", [k, n * groups], [k], [128, 64], 128)),
+            desc(tm(0, 1, "u8", [128, 64, n * groups // 64 * (k // 128)], [128, 8192], [128, 64, 1], 128)),
             desc(tm(0, 2, "i32", [rows, kw], [rows * 4], [-(-bm // 128) * 128, 1])),
             desc(tm(0, 3, "i32", [n, kw * groups], [n * 4], [64, 1])),
             desc(tm(0, 4, "u8", [inter, rows], [inter], [64, 16]))]

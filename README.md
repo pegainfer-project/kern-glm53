@@ -39,7 +39,7 @@ checkpoint (GLM-5.2-FP8 has the same tensors).
 
 | module | what | provenance |
 |---|---|---|
-| `glm_deepgemm` | fp8 1d1d GEMMs (dense, m-grouped psum; the routed gate-up's copy with a silu epilogue, `source/dg/`), bf16 batched GEMM (W_UK), fp8 MQA logits (bf16 out) and its schedule | new upstream: DeepGEMM `ab69f76b`, MIT |
+| `glm_deepgemm` | fp8 1d1d GEMMs (dense, m-grouped psum; copies for the routed gate-up with a silu epilogue and the routed down, both over tile-major weights, `source/dg/`), bf16 batched GEMM (W_UK), fp8 MQA logits (bf16 out) and its schedule | new upstream: DeepGEMM `ab69f76b`, MIT |
 | `glm_fp8_tiles` | the fp8 1d1d Normal GEMM in swap-AB on a 2-CTA cluster (the projections at few rows) and BN 256 on a 2-CTA cluster multicasting the weight (from a few hundred rows) | new upstream: DeepGEMM `ab69f76b`, MIT |
 | `glm_vup` | MLA's v up-projection (W_UV) writing o_proj's e4m3 input and its UE8M0 scales | DeepGEMM `ab69f76b`'s bf16 batched GEMM with an epilogue of ours (`source/glm_vup.cu`) |
 | `glm_flashmla2` | sparse MLA prefill, 64 heads, d_qk 576, two softmax warpgroups | FlashMLA `4f38f29e`'s head64 kernel, modified (`source/flashmla_h64x2/`), MIT |
@@ -58,7 +58,7 @@ kern-k3-pp-prefill (`source/k3/`) and kern-k31 (`source/k31/`). DeepGEMM and Fla
 the commits `kernels.toml` pins, MIT-licensed by DeepSeek (their own `LICENSE`); `source/glm_deepgemm.cu`
 only instantiates their templates; `source/flashmla_h64x2/` is FlashMLA's head64 prefill modified (its README
 says how), under FlashMLA's MIT license.
-and `source/glm_flashmla.cu` only instantiate their templates, and `source/dg/` holds a changed copy of
+and `source/glm_flashmla.cu` only instantiate their templates, and `source/dg/` holds changed copies of
 DeepGEMM's fp8 1d1d kernel under its MIT license (`source/dg/LICENSE.DeepGEMM`).
 
 `scripts/flashmla_probe.cu` records FlashMLA's launch parameter blocks without a GPU (upstream's host

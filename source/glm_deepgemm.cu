@@ -1,5 +1,6 @@
-// DeepGEMM's sm100 kernels at GLM-5.3's prefill shapes, unmodified but for the routed gate-up GEMM, whose
-// changed copy (dg/glm_moe_gu_silu.cuh) ends in silu and the e4m3 quantization. The generator names an
+// DeepGEMM's sm100 kernels at GLM-5.3's prefill shapes, unmodified but for the routed GEMMs, whose changed
+// copies read tile-major weights: dg/glm_moe_gu_silu.cuh (ending in silu and the e4m3 quantization) and
+// dg/glm_moe_dn.cuh. The generator names an
 // instance by its mangled template arguments (scripts/glm_deepgemm.py) and passes exactly the
 // shared memory asserted here.
 //   fp8: block-scaled e4m3 x e4m3 -> bf16, UE8M0 scales a 128-element K block for both operands
@@ -17,6 +18,7 @@
 #include "dg/sm100_mqa_logits.cuh"
 #include "dg/sm100_mqa_logits_metadata.cuh"
 #include "dg/glm_moe_gu_silu.cuh"
+#include "dg/glm_moe_dn.cuh"
 
 using namespace deep_gemm;
 using e4m3 = cutlass::float_e4m3_t;
@@ -66,6 +68,18 @@ static_assert(sizeof(glm::SiluSmem) == 576);
         epilogue::transform::EpilogueIdentity>);                                                        \
     asm volatile("" ::"l"(p)); }
 
+// The routed down GEMM at GLM_FP8_SWAP(BM, STAGES, 2, 257) over tile-major weights (dg/glm_moe_dn.cuh).
+#define GLM_FP8_DN(BM, STAGES, SMEM)                                                                     \
+  static_assert(sizeof(layout::SM100FP8FP4GemmSharedStorage<STAGES, 2, 2, BM / 2, 128, 128, 16, 128,   \
+                                                            (BM + 127) / 128 * 128, 128, 1, e4m3, e4m3, \
+                                                            bf16>) == SMEM);                            \
+  { auto p = reinterpret_cast<void*>(&glm_moe_dn_impl<                                                  \
+        cute::UMMA::Major::K, cute::UMMA::Major::K, 128, 128, 128, 0, 0, 0, BM, 128, 128, 257,          \
+        128, 128, 128, STAGES, 2, 128, 128, 2, true, 152, true, false,                                   \
+        GemmType::MGroupedContiguousWithPsumLayout, false, e4m3, e4m3, bf16,                            \
+        epilogue::transform::EpilogueIdentity>);                                                        \
+    asm volatile("" ::"l"(p)); }
+
 #define GLM_BF16(BM, BN, STAGES, SMEM)                                                                 \
   static_assert(sizeof(layout::SM100BF16GemmSharedStorage<STAGES, 2, 2, BM, BN, 64, BM, 64, bf16>) == \
                 SMEM);                                                                                \
@@ -86,8 +100,8 @@ void glm_instantiate() {
   GLM_FP8_NARROW(64, 7, 128, 212992)
   GLM_FP8_SWAP(32, 11, 2, 256, 223232)
   GLM_FP8_SWAP(64, 10, 2, 256, 224256)
-  GLM_FP8_SWAP(128, 8, 2, 257, 214016)
-  GLM_FP8_SWAP(256, 6, 2, 257, 215040)
+  GLM_FP8_DN(128, 8, 214016)
+  GLM_FP8_DN(256, 6, 215040)
   GLM_FP8_GU_SILU(128, 8, 214016)
   GLM_FP8_GU_SILU(256, 6, 215040)
   GLM_BF16(128, 128, 6, 230400)
