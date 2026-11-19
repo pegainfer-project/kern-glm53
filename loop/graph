@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+"""loop/graph ABDIR: the A/B's sub-model graph p50s weighted over the corpus as loop/score weights its grid, but
+unprojected: no per-call shares. A projected score moves when an op is split into more or fewer calls (a PDL call's
+in-program time holds its wait on the call before), the graph does not; a win shows in both."""
+import glob
+import json
+import pathlib
+import statistics
+import sys
+
+W = json.loads((pathlib.Path(__file__).resolve().parent / "weights.json").read_text())
+
+
+def graph(path):
+    r = json.loads(pathlib.Path(path).read_text())
+    g = {f"r{s['scenario']['rows']}-kv{s['scenario']['context'][0]}": s["graph"]["stats"]["p50"] / 1e3 for s in r["scenarios"]}
+    out = {n: sum(w * g[k] for k, w in ws.items()) / W["requests"][n] for n, ws in W["weights"].items()}
+    out["all"] = sum(out[n] * W["requests"][n] for n in W["weights"]) / sum(W["requests"].values())
+    return out
+
+
+def side(d, x):
+    runs = [graph(f) for f in sorted(glob.glob(f"{d}/{x}-*.json"))]
+    return {k: statistics.median(r[k] for r in runs) for k in runs[0]}
+
+
+a, b = side(sys.argv[1], "a"), side(sys.argv[1], "b")
+print("graph  " + "  ".join(f"{k} {a[k]:.2f} -> {b[k]:.2f} ms ({(b[k] / a[k] - 1) * 100:+.2f}%)" for k in a))

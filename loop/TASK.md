@@ -44,6 +44,8 @@ HBM's roofline; at 16384 rows it is near fp8's.
   epilogue); the generator; how the indexer computes. Its logits may be bf16 (as vLLM runs DSA on SM100);
   any other new rounding is a numerics change that must be measured and explained (below).
 - Program lanes (`"lane"` / `"after"` on a call, `$GLM_KERN/docs/manifest.md`) and PDL are available.
+  A call on a side lane must launch at every var value: one whose every launch a `when` gates off, joined by
+  a PDL call, can hang a captured replay (seen twice at 16384 rows).
 
 ## What you edit
 
@@ -69,6 +71,7 @@ run GPU work outside it. Outputs must be on the shared filesystem (the GPUs are 
 | `loop/count M...` | launches, per layer of each kind | none | 0 s |
 | `loop/bench M OUT` | kern bench of `l11.json` over the grid; prints each shape and `loop/score` | 1 | ~1 min |
 | `loop/ab A B OUT [N]` | A B B A ... on one GPU; per-shape medians and the score's change. The number to quote | 1 | ~2 min a pair |
+| `loop/graph ABDIR` | the same A/B's sub-model graph p50s over the corpus, unprojected: a win shows here too | 0 | seconds |
 | `loop/score REPORT [--by-op] [--grid]` | mean TTFT short / long / all; by op; per shape | none | 0 s |
 | `loop/longcheck M OUT` | **the numerics gate**: `l11.json` (1M bounds) teacher-forced against main's recordings, `long` (262144 tokens of real text in sixteen 16384-row chunks) and `short` (six chat prompts, 300-12k tokens, three chunks each); top-1 agreement, \|dlp\|, flips and confident flips | 1 | ~3 min |
 | `loop/check M OUT` | optional, to localize: `kern test` of `l11c.json` against main's, span by span (which call's outputs moved, by how much) | 1 | ~25 min |
@@ -108,8 +111,11 @@ SGLang before merging it.
   no period>`. The message has: the score before -> after from `loop/ab` (short / long / all), the shapes
   it moved, launches per layer before -> after when they changed, the numerics line with `loop/longcheck`'s
   two lines.
-- A commit is a win when `loop/longcheck` passes and `loop/ab` shows `all` lower and neither `short` nor `long`
-  higher beyond noise (0.3%); fewer launches at equal time is a win too. Commit each win as soon as it
+- A commit is a win when `loop/longcheck` passes and `loop/ab` shows `all` lower (by 0.1%) and neither `short`
+  nor `long` higher beyond noise (0.3%), and `loop/graph` on the same A/B shows `all` not higher; fewer launches
+  at equal time is a win too. The score projects 11 layers to 78 by each call's share of its time, and a PDL
+  call's time holds its wait on the call before, so splitting an op into more calls can move the score alone:
+  the graph doesn't move that way. Commit each win as soon as it
   passes. Keep every commit building and passing on its own.
 - The orchestrator merges wins into `main`, re-measures there and logs each in `loop/HISTORY.md`; when
   `main` moves it tells you in `ROUND.md`: rebase onto it then.
