@@ -78,3 +78,4 @@ sub-model -0.04% (graph -0.40%).
 | 40 | 70976fb | flash_mla's K gathers from three producer warps, none from the MMA warp's sub-partition | 207.51 | 959.27 | 236.96 | -0.34% | 415 | top-1 100.000% · flips 0 (confident 0) |
 | 41 | b50c880 | from 32k keys of context the indexer's logits read a split once for a 16-row q block | 207.20 | 958.29 | 236.62 | -0.14% | 460 | top-1 100.000% · flips 0 (confident 0) |
 | 42 | 8e4cee5 | the indexer's top-k samples a row of 32k to 96k keys for 1.75 x 2048 candidates | 206.88 | 957.77 | 236.35 | -0.11% | 460 | top-1 100.000% · flips 0 (confident 0) |
+| 43 | 435ddea | the top-k's sample counts its rest only at or above a floor its first eighth puts | 206.52 | 956.35 | 235.95 | -0.17% | 460 | top-1 100.000% · flips 0 (confident 0) |

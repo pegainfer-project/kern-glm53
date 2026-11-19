@@ -33,12 +33,15 @@ __device__ __forceinline__ unsigned keys2(unsigned w) {
 }
 
 // The key where the sample (k31_topk's, chunks 8-aligned) expects `want` / 16 keys at or above it: the
-// bottom of its 12-bit bin. A warp's chunk shares a weight, and its lanes' equal bins add once.
+// bottom of its 12-bit bin. Every eighth logit of the first batch counts first, a warp's equal bins once,
+// and puts a floor F where its own count expects `want` / 16; the rest count only at or above F, so the
+// bins there hold the whole sample's and the key is the same unless its bin is under F (then lower).
 __device__ __forceinline__ unsigned sample_key(Smem& s, const bf16* row, unsigned n, unsigned want) {
   constexpr unsigned PER = SAMPLE_CHUNK / 8, ENDS = (HEAD + TAIL) / SAMPLE_CHUNK, STEP = NT / PER, B = 8;
   const Sample m = sample_of(n);
   const unsigned t = threadIdx.x;
   for (unsigned i = t; i < BINS; i += NT) s.u.hist[i] = 0;
+  if (t == 0) s.cut = 0;
   __syncthreads();
   const auto at = [&](unsigned c) {
     return c == 0     ? 0
@@ -46,27 +49,62 @@ __device__ __forceinline__ unsigned sample_key(Smem& s, const bf16* row, unsigne
                       : HEAD + (unsigned)((unsigned long long)(c - ENDS) * (n - HEAD - TAIL - SAMPLE_CHUNK) /
                                           (m.interior - 1)) & ~7u;
   };
-  for (unsigned c0 = t / PER; c0 < m.chunks; c0 += B * STEP) {
-    uint4 v[B];
+  const auto load = [&](unsigned c0, uint4* v) {
 #pragma unroll
     for (int u = 0; u < B; ++u) {
       const unsigned c = c0 + u * STEP;
       v[u] = c < m.chunks ? __ldg(reinterpret_cast<const uint4*>(row + at(c) + t % PER * 8)) : make_uint4(0, 0, 0, 0);
     }
+  };
+  uint4 v[B];
+  unsigned c0 = t / PER;
+  load(c0, v);
+#pragma unroll
+  for (int u = 0; u < B; ++u) {
+    const unsigned c = c0 + u * STEP, w = c < ENDS ? 16u : m.w16;
+    if (c >= m.chunks) break;
+    const unsigned bin = keys2(v[u].x) >> 4 & 0xfff, peers = __match_any_sync(~0u, bin);
+    if (__ffs(peers) - 1 == (t & 31)) atomicAdd(&s.u.hist[bin], __popc(peers) * w);
+  }
+  __syncthreads();
+  unsigned F;
+  {
+    unsigned c[BPT], sum = 0;
+#pragma unroll
+    for (int k = 0; k < BPT; ++k) c[k] = s.u.hist[BINS - 1 - BPT * t - k], sum += c[k];
+    unsigned ab, tot;
+    Scan(s.scan).ExclusiveSum(sum, ab, tot);
+    const unsigned goal = (unsigned)min((unsigned long long)tot * want / (16ull * n), (unsigned long long)tot);
+#pragma unroll
+    for (int k = 0; k < BPT; ++k) {
+      if (ab < goal && ab + c[k] >= goal) s.cut = BINS - 1 - BPT * t - k;
+      ab += c[k];
+    }
+    __syncthreads();
+    F = s.cut;
+  }
+  const auto count = [&](unsigned k, unsigned w) {
+    const unsigned lo = k >> 4 & 0xfff, hi = k >> 20;
+    if (lo >= F) atomicAdd(&s.u.hist[lo], w);
+    if (hi >= F) atomicAdd(&s.u.hist[hi], w);
+  };
+  for (;;) {
 #pragma unroll
     for (int u = 0; u < B; ++u) {
       const unsigned c = c0 + u * STEP, w = c < ENDS ? 16u : m.w16;
       if (c >= m.chunks) break;
-      const unsigned x[4] = {v[u].x, v[u].y, v[u].z, v[u].w};
+      const unsigned k0 = keys2(v[u].x);
+      if ((k0 >> 20) >= F) atomicAdd(&s.u.hist[k0 >> 20], w);
+      count(keys2(v[u].y), w), count(keys2(v[u].z), w), count(keys2(v[u].w), w);
+    }
+    c0 += B * STEP;
+    if (c0 >= m.chunks) break;
+    load(c0, v);
 #pragma unroll
-      for (int q = 0; q < 4; ++q) {
-        const unsigned k = keys2(x[q]);
-#pragma unroll
-        for (int h = 0; h < 2; ++h) {
-          const unsigned bin = h ? k >> 20 : k >> 4 & 0xfff, peers = __match_any_sync(~0u, bin);
-          if (__ffs(peers) - 1 == (t & 31)) atomicAdd(&s.u.hist[bin], __popc(peers) * w);
-        }
-      }
+    for (int u = 0; u < B; ++u) {
+      const unsigned c = c0 + u * STEP, w = c < ENDS ? 16u : m.w16;
+      if (c >= m.chunks) break;
+      count(keys2(v[u].x), w);
     }
   }
   __syncthreads();
