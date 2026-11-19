@@ -80,6 +80,7 @@ git add -A
 git commit -q -C "$sha" --signoff
 cp "$work/l11.json" "$work/l11c.json" "$base/"
 cp "$work/ab/b-1.json" "$base/bench-$n.json"
-rm -f "$base"/l11.json.long* "$base"/l11.json.short* "$base"/l11.json.log
-"$LOOP_DIR/longcheck" "$base/l11.json" "$work/rebase-rec" > /dev/null
+# the gate's candidate recordings are the new main's: they become the base's, newer than its manifest
+for pass in long-c16 short-c3; do cp "$work/lc.$pass.pt" "$base/l11.json.$pass.pt"; done
+touch "$base"/l11.json.long-c16.pt "$base"/l11.json.short-c3.pt
 echo "land: $(git log -1 --format='%h %s') by $author · row $n · $short / $long / $all ms ($delta)"
