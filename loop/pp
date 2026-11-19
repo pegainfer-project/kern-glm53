@@ -3,7 +3,7 @@
 # directories (stage0..3.json at serving bounds). Each pair runs A then B (B then A on even pairs) with stage i on
 # leased GPU i, all four at once; loop/ppscore sums a shape's four graph p50s (one chunk through the pipeline,
 # idle) and weights the grid as loop/score does; the gate reads stage 0, the stage on real inputs (loop/ppscore). No
-# projection, no per-call shares.
+# projection, no per-call shares. PP_FROM=K runs pairs K..N only, onto an OUT that has the pairs before K.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 a=$(realpath "$1") b=$(realpath "$2") out=$(realpath -m "$3") n=${4:-2}
@@ -18,7 +18,7 @@ side() {  # side tag pair -> one command running the four stages at once
   echo "${cmd}wait"
 }
 runs=""
-for i in $(seq 1 "$n"); do
+for i in $(seq "${PP_FROM:-1}" "$n"); do
   ra="{ $(side "$a" a "$i"); } && " rb="{ $(side "$b" b "$i"); } && "
   ((i % 2)) && runs+="$ra$rb" || runs+="$rb$ra"
 done

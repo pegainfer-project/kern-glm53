@@ -3,7 +3,7 @@
 #
 # Cherry-picks SHA without committing (a conflict only in kernels.toml takes SHA's side hunk by hunk), builds and repins, generates the sub-model, A/Bs main's base
 # against it (loop/ab, four pairs, and loop/graph: the sub-model's view, printed only), runs the numerics gate against
-# main (loop/longcheck) and times main's PP4 serving stage 0 against the pick's (loop/pp, two pairs). Then,
+# main (loop/longcheck) and times main's PP4 serving stage 0 against the pick's (loop/pp, two pairs, four when stage 0's all lands between the bar and zero). Then,
 # only with LAND=1 and the gate passing (loop/pp's all lower by 0.1%, or fewer launches and all not up; short and long not up beyond 0.3%, longcheck inside
 # TASK.md's floor): appends the HISTORY.md row (main's commit it lands after, the row above times the A/B's B/A ratio per scenario,
 # Δ all the A/B's own, launches, the gate's long line, NOTE) and commits the pick with SHA's message and author; main's base moves to it
@@ -55,6 +55,12 @@ mkdir -p "$work"
 PATH=$(dirname "$GLM_NVCC"):$PATH KERN_INDEX_DIR=$GLM_KERN/kernel_index "$REPO/scripts/deploy.sh" "$GLM_KERN" "$work/stages" \
   > "$work/deploy.log" 2>&1 || { tail -3 "$work/deploy.log"; exit 1; }
 "$LOOP_DIR/pp" "$base/p" "$work/stages/p" "$work/pp" 2 | tee "$work/pp.txt"
+# a stage-0 all between the bar and zero is inside two pairs' noise (~0.05%): two more pairs decide it
+pp_all=$(grep -E '^pp ' "$work/pp.txt" | grep -oE 'all [0-9.]+ -> [0-9.]+ ms \([-+][0-9.]+%\)' | grep -oE '[-+][0-9.]+%' | tr -d '%')
+if python3 -c "import sys; sys.exit(0 if -0.1 < float(sys.argv[1]) <= 0 else 1)" "${pp_all:-1}"; then
+  echo "land: stage 0's all ${pp_all}% is inside two pairs' noise of the bar; pairs 3 and 4"
+  PP_FROM=3 "$LOOP_DIR/pp" "$base/p" "$work/stages/p" "$work/pp" 4 | tee "$work/pp.txt"
+fi
 [[ ${LAND:-0} == 1 ]] || { echo "land: staged, not committed (LAND=1 to commit)"; exit 0; }
 launches() { grep -oE '[0-9]+ launches' "$1" | head -1 | cut -d' ' -f1; }
 "$LOOP_DIR/count" "$base/l11.json" > "$work/count-base.txt" 2>/dev/null || true
