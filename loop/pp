@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# loop/pp A B OUT [N]: the 78-layer PP4 stages themselves, A against B. A and B are scripts/deploy.sh outputs' `p`
+# loop/pp A B OUT [N]: the PP4 serving stages, A against B. A and B are scripts/deploy.sh outputs' `p`
 # directories (stage0..3.json at serving bounds). Each pair runs A then B (B then A on even pairs) with stage i on
 # leased GPU i, all four at once; loop/ppscore sums a shape's four graph p50s (one chunk through the pipeline,
-# idle, as loop/score's projection reads a chunk) and weights the grid as loop/score does. No projection, no
-# per-call shares: the number loop/score estimates, measured.
+# idle) and weights the grid as loop/score does; the gate reads stage 0, the stage on real inputs (loop/ppscore). No
+# projection, no per-call shares.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 a=$(realpath "$1") b=$(realpath "$2") out=$(realpath -m "$3") n=${4:-2}

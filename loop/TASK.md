@@ -71,7 +71,7 @@ run GPU work outside it. Outputs must be on the shared filesystem (the GPUs are 
 | `loop/count M...` | launches, per layer of each kind | none | 0 s |
 | `loop/bench M OUT` | kern bench of `l11.json` over the grid; prints each shape and `loop/score` | 1 | ~1 min |
 | `loop/ab A B OUT [N]` | A B B A ... on one GPU; per-shape medians and the score's change. The number to quote | 1 | ~2 min a pair |
-| `loop/pp A B OUT [N]` | the 78-layer PP4 serving stages (scripts/deploy.sh's `p`), A against B, all four GPUs; the orchestrator's gate | 4 | ~4.5 min a pair |
+| `loop/pp A B OUT [N]` | the PP4 serving stages (scripts/deploy.sh's `p`), A against B, all four GPUs; `pp` is stage 0 (layers 0-17, real inputs), the orchestrator's gate; `pp1-3` runs on synthetic activations, printed only | 4 | ~4.5 min a pair |
 | `loop/graph ABDIR` | the same A/B's sub-model graph p50s over the corpus, unprojected: a win shows here too | 0 | seconds |
 | `loop/score REPORT [--by-op] [--grid]` | mean TTFT short / long / all; by op; per shape | none | 0 s |
 | `loop/longcheck M OUT` | **the numerics gate**: `l11.json` (1M bounds) teacher-forced against main's recordings, `long` (262144 tokens of real text in sixteen 16384-row chunks) and `short` (six chat prompts, 300-12k tokens, three chunks each); top-1 agreement, \|dlp\|, flips and confident flips | 1 | ~3 min |
@@ -117,9 +117,9 @@ SGLang before merging it.
   at equal time is a win too. The score projects 11 layers to 78 by each call's share of its time, and a PDL
   call's time holds its wait on the call before, so splitting an op into more calls can move the score alone:
   the graph doesn't move that way.
-  The orchestrator gates on `loop/pp` (all lower by 0.1%, short and long not up by 0.3%): the sub-model has the first
-  five indexer layers only, so a data-dependent kernel (the top-k) can read faster there and be slower on the
-  real stages. Run `loop/pp` yourself before committing such a change. Commit each win as soon as it
+  The orchestrator gates on `loop/pp`'s stage 0 (all lower by 0.1%, short and long not up by 0.3%). Stages 1-3
+  run on synthetic activations, so a data-dependent kernel (the top-k, the MoE's routing) is measured on real
+  inputs only in stage 0 and the sub-model; for deep layers use real dumps (idx's notes: chain the stages). Commit each win as soon as it
   passes. Keep every commit building and passing on its own.
 - The orchestrator merges wins into `main`, re-measures there and logs each in `loop/HISTORY.md`; when
   `main` moves it tells you in `ROUND.md`: rebase onto it then.

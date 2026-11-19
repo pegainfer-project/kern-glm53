@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""loop/ppscore OUT N: loop/pp's reports scored. A shape's time is its four stages' graph p50s summed; the grid is
-weighted over the corpus as loop/score weights its own (loop/weights.json). Prints each shape's A/B change and the
-per-pair medians of short / long / all."""
+"""loop/ppscore OUT N: loop/pp's reports scored. A shape's time is stage 0's graph p50 (`pp`, the gate's) and, apart,
+stages 1-3's summed (`pp1-3`); the grid is weighted over the corpus as loop/score weights its own (loop/weights.json).
+A stage benched alone runs on synthetic activations: stage 0 starts from the tokens, so its 18 layers see real
+inputs; stages 1-3 see none (every indexer layer the same time, the MoE at about half its real time), so their
+line is printed only. Prints stage 0's A/B change a shape, then both lines."""
 import json
 import pathlib
 import statistics
@@ -11,9 +13,9 @@ W = json.loads((pathlib.Path(__file__).resolve().parent / "weights.json").read_t
 out, n = pathlib.Path(sys.argv[1]), int(sys.argv[2])
 
 
-def grid(x, i):
+def grid(x, i, stages):
     g = {}
-    for s in range(4):
+    for s in stages:
         for sc in json.loads((out / f"{x}-{i}.s{s}.json").read_text())["scenarios"]:
             k = f"r{sc['scenario']['rows']}-kv{sc['scenario']['context'][0]}"
             g[k] = g.get(k, 0.0) + sc["graph"]["stats"]["p50"] / 1e3
@@ -26,12 +28,14 @@ def score(g):
     return r
 
 
-ga = [grid("a", i) for i in range(1, n + 1)]
-gb = [grid("b", i) for i in range(1, n + 1)]
+ga = [grid("a", i, [0]) for i in range(1, n + 1)]
+gb = [grid("b", i, [0]) for i in range(1, n + 1)]
 for k in ga[0]:
     a, b = statistics.median(g[k] for g in ga), statistics.median(g[k] for g in gb)
     print(f"{k:16s} A {a:9.2f}  B {b:9.2f}  {(b / a - 1) * 100:+.2f}%")
-sa, sb = [score(g) for g in ga], [score(g) for g in gb]
 med = lambda s, k: statistics.median(x[k] for x in s)
-print("pp     " + "  ".join(f"{k} {med(sa, k):.2f} -> {med(sb, k):.2f} ms ({(med(sb, k) / med(sa, k) - 1) * 100:+.2f}%)"
-                           for k in sa[0]))
+line = lambda sa, sb: "  ".join(f"{k} {med(sa, k):.2f} -> {med(sb, k):.2f} ms ({(med(sb, k) / med(sa, k) - 1) * 100:+.2f}%)"
+                                for k in sa[0])
+rest = lambda x: [score(grid(x, i, [1, 2, 3])) for i in range(1, n + 1)]
+print("pp1-3  " + line(rest("a"), rest("b")))
+print("pp     " + line([score(g) for g in ga], [score(g) for g in gb]))

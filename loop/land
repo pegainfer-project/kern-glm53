@@ -3,7 +3,7 @@
 #
 # Cherry-picks SHA without committing (a conflict only in kernels.toml takes SHA's side hunk by hunk), builds and repins, generates the sub-model, A/Bs main's base
 # against it (loop/ab, four pairs, and loop/graph: the sub-model's view, printed only), runs the numerics gate against
-# main (loop/longcheck) and times main's PP4 serving stages against the pick's (loop/pp, two pairs). Then,
+# main (loop/longcheck) and times main's PP4 serving stage 0 against the pick's (loop/pp, two pairs). Then,
 # only with LAND=1 and the gate passing (loop/pp's all lower by 0.1%, or fewer launches and all not up; short and long not up beyond 0.3%, longcheck inside
 # TASK.md's floor): appends the HISTORY.md row (main's commit it lands after, the row above times the A/B's B/A ratio per scenario,
 # Δ all the A/B's own, launches, the gate's long line, NOTE) and commits the pick with SHA's message and author; main's base moves to it
@@ -50,7 +50,7 @@ mkdir -p "$work"
 "$LOOP_DIR/ab" "$base/l11.json" "$work/l11.json" "$work/ab" 4 | tee "$work/ab.txt"
 "$LOOP_DIR/graph" "$work/ab" | tee -a "$work/ab.txt"
 "$LOOP_DIR/longcheck" "$work/l11.json" "$work/lc" | tee "$work/lc.txt"
-# the gate's timing: the 78-layer PP4 serving stages themselves (loop/pp), main's against the pick's
+# the gate's timing: PP4 serving stage 0 on real inputs (loop/pp's `pp`), main's against the pick's
 PATH=$(dirname "$GLM_NVCC"):$PATH KERN_INDEX_DIR=$GLM_KERN/kernel_index "$REPO/scripts/deploy.sh" "$GLM_KERN" "$work/stages" \
   > "$work/deploy.log" 2>&1 || { tail -3 "$work/deploy.log"; exit 1; }
 "$LOOP_DIR/pp" "$base/p" "$work/stages/p" "$work/pp" 2 | tee "$work/pp.txt"
