@@ -61,3 +61,4 @@ SGLang's prompt logprobs (its fp8-KV run), and against the checkpoint before.
 | 35 | 4388135 | indexer layer's q absorb on lane 1 beside the indexer, flash_mla joins it | 210.30 | 975.32 | 240.28 | -0.14% | 467 | top-1 100.000% · flips 0 (confident 0) |
 | 36 | e8bee89 | an indexer call scores 2048 rows at once, half the indexer launches | 210.80 | 974.87 | 240.74 | +0.19% | 382 | top-1 100.000% · flips 0 (confident 0) |
 | 37 | 85ba617 | projections' multicast tiles take the BN whose tiles fill the SMs' last wave | 209.78 | 974.12 | 239.73 | -0.42% | 415 | top-1 100.000% · flips 0 (confident 0) |
+| 38 | db1d156 | indexer logits: 8-row q blocks on two math warpgroups, an MMA of N 256 each | 208.56 | 966.34 | 238.25 | -0.62% | 415 | top-1 100.000% · flips 0 (confident 0) |

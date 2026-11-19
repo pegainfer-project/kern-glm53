@@ -211,17 +211,17 @@ def vup_quant(n, k, rows, a, b):
                                       when={"var": T, "min": MC_ROWS + 1})]}}
 
 
-# ---- the lightning indexer over one sub-chunk of R rows: DeepGEMM's metadata kernel deals the (4-row q block, 384-key
-# split) work evenly over the SMs, its fp8 MQA logits follow it on three math warpgroups, a split's keys in 128-key TMA
-# tiles (bf16, compressed: row r's logits at [r][0, ke - ks)),
+# ---- the lightning indexer over one sub-chunk of R rows: DeepGEMM's metadata kernel deals the (8-row q block, 256-key
+# split) work evenly over the SMs, its fp8 MQA logits follow it on two math warpgroups, a split's 256 keys one TMA tile
+# (bf16, compressed: row r's logits at [r][0, ke - ks)),
 # then each row's top-k (glm_topk: vLLM's set, ascending, the same bytes every run; a row of at most 32k read once, a
 # longer one's sample and then the row read once against a threshold)
-MQA_ENTRY = ("_ZN9deep_gemm16sm100_mqa_logitsILj32ELj128ELb0ELb1ELb0ELb1ELj4ELj384ELj3ELj3ELj152ELj128ELj384E"
-             "N7cutlass12float_e4m3_tE13__nv_bfloat16S3_Lj3EEEvjjjPKjS5_S5_PT13_14CUtensorMap_stS8_S8_S8_S8_")
-META_ENTRY = "_ZN9deep_gemm5sched33sm100_mqa_logits_metadata_batchedILj4ELj384ELj152ELj1ELj1ELj15EEEvjjjPKjS3_Pjj"
+MQA_ENTRY = ("_ZN9deep_gemm16sm100_mqa_logitsILj32ELj128ELb0ELb1ELb0ELb1ELj8ELj256ELj2ELj4ELj152ELj128ELj256E"
+             "N7cutlass12float_e4m3_tE13__nv_bfloat16S3_Lj2EEEvjjjPKjS5_S5_PT13_14CUtensorMap_stS8_S8_S8_S8_")
+META_ENTRY = "_ZN9deep_gemm5sched33sm100_mqa_logits_metadata_batchedILj8ELj256ELj152ELj1ELj1ELj15EEEvjjjPKjS3_Pjj"
 TOPK = 2048
 TOPK_SMEM = 93408  # sizeof(Smem) of source/k31/k31_topk.cu
-BLOCK_Q = 4
+BLOCK_Q, SPLIT_KV = 8, 256
 
 
 def meta_words(r):
@@ -237,16 +237,16 @@ def indexer(j, r, kv_cap, pick_rows):
     rows) and the call's rows. Every row pointer is the call's, offset to the sub-chunk's first row; the logits
     are the sub-chunk's own, the schedule its slice."""
     when = {"var": T, "min": j * r + 1}
-    sf = tm(0, 2, "f32", [kv_cap, 1], [kv_cap * 4], [128, 1])
-    maps = [desc(tm(0, 0, "u8", [128, r * 32], [128], [128, 128], 128)), desc(sf),
-            desc(tm(0, 1, "u8", [128, kv_cap], [128], [128, 128], 128)), desc(sf),
-            desc(tm(0, 3, "bf16", [32, r], [64], [32, 4], 0))]
+    sf = tm(0, 2, "f32", [kv_cap, 1], [kv_cap * 4], [SPLIT_KV, 1])
+    maps = [desc(tm(0, 0, "u8", [128, r * 32], [128], [128, BLOCK_Q * 32], 128)), desc(sf),
+            desc(tm(0, 1, "u8", [128, kv_cap], [128], [128, SPLIT_KV], 128)), desc(sf),
+            desc(tm(0, 3, "bf16", [32, r], [64], [32, BLOCK_Q], 0))]
     # sub-chunk 0 schedules the call's every sub-chunk, a block each, into its own slice of the schedule
     meta = [launch("glm_deepgemm", META_ENTRY, [{"ceil_div": [T, r]}, 1, 1], [256, 1, 1], 8 * -(-r // BLOCK_Q),
                    params=["i32", "i32", "i32", "in buffer<u32>", "in buffer<u32>", "out buffer<i32>", "i32"],
                    args=[{"param": 17}, {"i32": r}, {"param": 11}, {"param": 4}, {"param": 5}, {"param": 13},
                          {"i32": meta_words(r)}], when=when, pdl=True)] if j == 0 else []
-    mqa = launch("glm_deepgemm", MQA_ENTRY, [SMS, 1, 1], [512, 1, 1], 202752,
+    mqa = launch("glm_deepgemm", MQA_ENTRY, [SMS, 1, 1], [384, 1, 1], 202752,
                  params=["i32", "i32", "i32", "in buffer<u32>", "in buffer<u32>", "in buffer<i32>", "out buffer<bf16>",
                          *["bytes<128>"] * 5],
                  args=[{"param": 10}, {"param": 11}, {"param": 12}, {"param": 4}, {"param": 5}, {"param": 13},

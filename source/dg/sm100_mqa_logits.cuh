@@ -85,7 +85,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
         cute::prefetch_tma_descriptor(&tensor_map_sf_kv);
     }
 
-    static constexpr uint32_t kNumTmemStages = 3;
+    static constexpr uint32_t kNumTmemStages = BLOCK_Q * kNumHeads > 128 ? 2 : 3;
     static constexpr uint32_t kNumUTCCPAlignedElems = 128;
     static constexpr uint32_t UMMA_M = 128;
     static constexpr uint32_t BLOCK_QH = BLOCK_Q * kNumHeads;
@@ -389,9 +389,6 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
         constexpr bool kIsReduceBF16 = not cute::is_same_v<reduce_dtype_t, float>;
         DG_STATIC_ASSERT(kNumHeads % 4 == 0, "Head count must be a multiple of 4");
         DG_STATIC_ASSERT(8 <= UMMA_N and UMMA_N <= 256, "Invalid UMMA_N for MMA");
-        using weights_reg_dtype_t = cute::conditional_t<kIsReduceBF16, nv_bfloat162, float>;
-        constexpr uint32_t kNumWeightsRegPerToken = kIsReduceBF16 ? (kNumHeads / 2) : kNumHeads;
-        weights_reg_dtype_t weights[BLOCK_Q][kNumWeightsRegPerToken];
         float accum[kNumHeads];
 
         auto scheduler = make_scheduler(sm_idx);
@@ -405,126 +402,59 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
             const auto process_q_block = [&](auto num_valid_tokens_t) {
                 constexpr uint32_t kNumValidTokens = decltype(num_valid_tokens_t)::value;
 
+                DG_STATIC_ASSERT(kIsReduceBF16 and kIsCompressedLogits and not kIsMXSF and kNumHeads == 32, "GLM's indexer only");
+                // A row's logits at its element offset in the sub-chunk's buffer (rows x stride < 2^32); its head
+                // weights read from shared memory where they sum, the registers going to the block's relu'd heads
+                uint32_t off[kNumValidTokens], rel[kNumValidTokens], len[kNumValidTokens];
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
-                    const auto smem_weights_row = smem.smem_weights[q_stage_idx] + i * kNumWeightElementsPerRow;
-                    if constexpr (kIsReduceBF16) {
-                        // Load two bf16 weights at a time as one packed shared u32
-                        const auto packed_row = reinterpret_cast<const uint32_t*>(smem_weights_row);
-                        #pragma unroll
-                        for (uint32_t j = 0; j < kNumHeads / 2; ++ j) {
-                            const auto packed = ptx::ld_shared(packed_row + j);
-                            weights[i][j] = ptx::exchange(*reinterpret_cast<const nv_bfloat162*>(&packed), 0);
-                        }
-                    } else {
-                        #pragma unroll
-                        for (uint32_t j = 0; j < kNumHeads; ++ j)
-                            weights[i][j] = ptx::ld_shared(smem_weights_row + j);
-                    }
+                    rel[i] = kv_base + math_thread_idx - seq_k_start[i];
+                    off[i] = scheduler.get_logits_row(q_block_idx, i) * logits_stride + rel[i];
+                    len[i] = seq_k_end[i] - seq_k_start[i];
                 }
 
                 for (uint32_t kv_split_idx = 0; kv_split_idx < num_kv_splits; ++ kv_split_idx) {
-                    auto kv_offset = scheduler.get_logits_col(kv_base, kv_split_idx, math_thread_idx);
-
-                    // FP8 consumes the KV pipeline directly to read per-KV scales;
-                    // MXFP4 / MXFP8 folds its scale into the MX SF UMMA, no extra scale
-                    reduce_dtype_t scale_kv = static_cast<reduce_dtype_t>(0.0f);
-                    uint32_t kv_stage_idx = 0;
-                    if constexpr (not kIsMXSF) {
-                        CUTE_TIE_DECL(kv_pipeline.advance(), kv_stage_idx_local, kv_phase);
-                        kv_stage_idx = kv_stage_idx_local;
-                        smem.full_kv_barriers[kv_stage_idx].wait(kv_phase);
-                        scale_kv = static_cast<reduce_dtype_t>(ptx::ld_shared(smem.smem_sf_kv[kv_stage_idx] + math_thread_idx));
-                    }
+                    CUTE_TIE_DECL(kv_pipeline.advance(), kv_stage_idx, kv_phase);
+                    smem.full_kv_barriers[kv_stage_idx].wait(kv_phase);
+                    const auto scale_kv = static_cast<reduce_dtype_t>(ptx::ld_shared(smem.smem_sf_kv[kv_stage_idx] + math_thread_idx));
 
                     CUTE_TIE_DECL(tmem_pipeline.advance(kNumMathWarpGroups), tmem_stage_idx, tmem_phase);
                     smem.full_tmem_barriers[tmem_stage_idx].wait(tmem_phase);
                     ptx::tcgen05_after_thread_sync();
+                    smem.empty_kv_barriers[kv_stage_idx].arrive();
 
-                    // Release KV smem only after UMMA commits TMEM; earlier release races TMA overwrite
-                    if constexpr (not kIsMXSF) {
-                        cutlass::arch::fence_view_async_shared();
-                        smem.empty_kv_barriers[kv_stage_idx].arrive();
+                    // Every row's relu'd bf16 pairs out of TMEM first: the stage goes back to the MMA before the head sums
+                    nv_bfloat162 relu[kNumValidTokens][kNumHeads / 2];
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
+                        ptx::tmem_load_32dp32b<kNumHeads>(tmem_stage_idx * UMMA_N + i * kNumHeads, reinterpret_cast<uint32_t*>(accum));
+                        cutlass::arch::fence_view_async_tmem_load();
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kNumHeads / 2; ++ j)
+                            relu[i][j] = ptx::cvt_relu_bf16x2_f32(make_float2(accum[2 * j], accum[2 * j + 1]));
                     }
+                    ptx::tcgen05_before_thread_sync();
+                    smem.empty_tmem_barriers[tmem_stage_idx].arrive();
 
                     #pragma unroll
                     for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
-                        uint32_t tmem_addr = tmem_stage_idx * UMMA_N + i * kNumHeads;
-                        if constexpr (kNumHeads == 8) {
-                            ptx::tmem_load_32dp32b<kNumHeads>(tmem_addr, reinterpret_cast<uint32_t*>(accum));
-                            cutlass::arch::fence_view_async_tmem_load();
-                        } else if constexpr (kNumHeads == 16) {
-                            ptx::tmem_load_32dp32b<kNumHeads / 2>(tmem_addr, reinterpret_cast<uint32_t*>(accum));
-                            ptx::tmem_load_32dp32b<kNumHeads / 2>(tmem_addr + kNumHeads / 2,
-                                                                  reinterpret_cast<uint32_t*>(accum + kNumHeads / 2));
-                            cutlass::arch::fence_view_async_tmem_load();
-                        } else if constexpr (kNumHeads == 32 or kNumHeads == 64) {
-                            ptx::tmem_load_32dp32b<kNumHeads / 2>(tmem_addr, reinterpret_cast<uint32_t*>(accum));
-                            cutlass::arch::fence_view_async_tmem_load();
-                            ptx::tmem_load_32dp32b<kNumHeads / 2>(tmem_addr + kNumHeads / 2,
-                                                                  reinterpret_cast<uint32_t*>(accum + kNumHeads / 2));
-                            cutlass::arch::fence_view_async_tmem_load();
-                        } else {
-                            load_tmem_heads_decomposed<kNumHeads>(tmem_addr, accum);
-                            cutlass::arch::fence_view_async_tmem_load();
+                        const auto w = reinterpret_cast<const uint4*>(smem.smem_weights[q_stage_idx] + i * kNumWeightElementsPerRow);
+                        nv_bfloat162 wr[kNumHeads / 2];
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kNumHeads / 8; ++ j)
+                            *reinterpret_cast<uint4*>(wr + 4 * j) = w[j];
+                        auto sum_0 = __floats2bfloat162_rn(0.0f, 0.0f);
+                        auto sum_1 = __floats2bfloat162_rn(0.0f, 0.0f);
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kNumHeads / 2; j += 2) {
+                            sum_0 = __hfma2(relu[i][j], wr[j], sum_0);
+                            sum_1 = __hfma2(relu[i][j + 1], wr[j + 1], sum_1);
                         }
-
-                        if (i == kNumValidTokens - 1) {
-                            ptx::tcgen05_before_thread_sync();
-                            smem.empty_tmem_barriers[tmem_stage_idx].arrive();
-                        }
-
-                        reduce_dtype_t reduced;
-                        if constexpr (kIsReduceBF16) {
-                            auto sum_0 = __floats2bfloat162_rn(0.0f, 0.0f);
-                            auto sum_1 = __floats2bfloat162_rn(0.0f, 0.0f);
-                            const auto transform = [&](const uint32_t& j, const nv_bfloat162& sum) {
-                                const auto a = ptx::cvt_relu_bf16x2_f32(make_float2(accum[j], accum[j + 1]));
-                                const auto b = weights[i][j / 2];
-                                return __hfma2(a, b, sum);
-                            };
-
-                            #pragma unroll
-                            for (uint32_t j = 0; j < kNumHeads; j += 4) {
-                                sum_0 = transform(j, sum_0);
-                                sum_1 = transform(j + 2, sum_1);
-                            }
-
-                            auto sum = __hadd2_rn(sum_0, sum_1);
-                            reduced = __hadd_rn(sum.x, sum.y);
-                        } else {
-                            auto sum_0 = make_float2(0, 0);
-                            auto sum_1 = make_float2(0, 0);
-                            const auto transform = [&](const uint32_t& j, const float2& sum) {
-                                auto a_0 = make_float2(accum[j], accum[j + 1]);
-                                auto a_1 = make_float2(fabsf(accum[j]), fabsf(accum[j + 1]));
-                                auto b = make_float2(weights[i][j], weights[i][j + 1]);
-                                return __ffma2_rn(__fadd2_rn(a_0, a_1), b, sum);
-                            };
-
-                            #pragma unroll
-                            for (uint32_t j = 0; j < kNumHeads; j += 4) {
-                                sum_0 = transform(j, sum_0);
-                                sum_1 = transform(j + 2, sum_1);
-                            }
-
-                            auto sum = __fadd2_rn(sum_0, sum_1);
-                            reduced = (sum.x + sum.y) / 2;
-                        }
-                        auto result = static_cast<logits_dtype_t>(kIsMXSF ? reduced : reduced * scale_kv);
-                        const auto q_offset = scheduler.get_logits_row(q_block_idx, i) * static_cast<uint64_t>(logits_stride);
-                        if constexpr (kIsCompressedLogits) {
-                            const uint32_t rel_kv = kv_offset - seq_k_start[i];
-                            const uint32_t len = seq_k_end[i] - seq_k_start[i];
-                            if (rel_kv < len)
-                                logits[q_offset + rel_kv] = result;
-                        } else if constexpr (kCleanLogits) {
-                            const uint32_t rel_kv = kv_offset - seq_k_start[i];
-                            const uint32_t len = seq_k_end[i] - seq_k_start[i];
-                            logits[q_offset + kv_offset] = rel_kv < len ? result : kNegInf;
-                        } else {
-                            logits[q_offset + kv_offset] = result;
-                        }
+                        const auto sum = __hadd2_rn(sum_0, sum_1);
+                        const auto result = static_cast<logits_dtype_t>(__hadd_rn(sum.x, sum.y) * scale_kv);
+                        if (rel[i] < len[i])
+                            logits[off[i]] = result;
+                        rel[i] += SPLIT_KV, off[i] += SPLIT_KV;
                     }
                 }
             };
