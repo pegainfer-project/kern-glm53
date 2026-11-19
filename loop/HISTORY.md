@@ -89,3 +89,4 @@ sub-model -0.04% (graph -0.40%).
 | 45 | 2e0d615 | the norms hold a row as packed bf16, five rows an SM | 205.75 | 953.04 | 235.06 | -0.17% | 454 | top-1 100.000% · flips 0 (confident 0) |
 | 46 | f6a3899 | norms, mla_prep and combine_quant trigger the PDL GEMM after them early | 205.52 | 953.25 | 234.84 | -0.10% | 454 | top-1 100.000% · flips 0 (confident 0) |
 | 47 | 7b84667 | dense gate-up as the routed fused kernel over one group | 205.11 | 950.28 | 234.30 | -0.23% | 451 | top-1 100.000% · flips 0 (confident 0) |
+| 48 | 952b6be | indexer schedule once a call; head-weight projection and key gather on lane 1 | 204.93 | 951.70 | 234.17 | -0.06% | 443 | top-1 100.000% · flips 0 (confident 0) |

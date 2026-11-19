@@ -200,6 +200,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
     ops["mla_prep_shared"] = G.nulled("glm_glue", prep, prep_params, {8, 9, 10}, [T, 1, 1], [256, 1, 1])
     for j in range(chunk // sub):
         ops[f"indexer.{j}"] = G.indexer(j, sub, max_ctx, PICK_ROWS if kv_dtype == "fp8" else 0)
+    ops["indexer_meta"] = G.indexer_meta(sub)
 
     gemms = {
         "a.full": (NA[True], H, chunk, H, NA[True], chunk, 1),
@@ -353,6 +354,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
     def plan(l):
         step(f"L{l}.plan", "plan", buf("cu_seqlens"), buf("seq_lens"), var(S), buf("pos"), buf("ks"), buf("ke"),
              buf("klen"), buf("row_seq"), buf("zero"), buf("ident"), buf("srows"), var(T))
+        step(f"L{l}.indexer_meta", "indexer_meta", var(T), var(CTX), buf("ks"), buf("ke"), buf("imeta"))
 
     plan(first)
     step("embed", "embed", buf("token_ids"), buf("embed"), buf("res"), var(T), i32(H))
@@ -403,13 +405,17 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
         elif not fused(l - 1):
             step(n + "norm_in", "add_quant", buf("h"), buf("res"), buf(n + "gamma_in"), buf("xq"), buf("xsf"),
                  i32(chunk), var(T))
+        if full:  # the indexer's head weights, then its keys' gather, beside the query chain up to q_post
+            step(n + "weights_proj", "gemm_bf16", buf("xn"), buf(n + "w_p"), buf("iw"), var(T), i32(IH), i32(H), i32(IH),
+                 lane=1, after=[0])
         gemm(n + "a", "a.full" if full else "a.shared", "xq", n + "w_a", "qa")
         kv = st(f"kv.{l}")
         if full:
-            step(n + "weights_proj", "gemm_bf16", buf("xn"), buf(n + "w_p"), buf("iw"), var(T), i32(IH), i32(H), i32(IH))
             step(n + "prep", "mla_prep_full", buf("qa"), i32(NA[True]), buf(n + "g_q"), buf(n + "g_kv"), buf("rope"),
                  buf("pos"), buf("slot_mapping"), kv, st(f"idx.{l}"), buf(n + "ik_w"), buf(n + "ik_b"), buf("qq"),
                  buf("qsf"), i32(chunk), var(T))
+            step(n + "idx_gather", "idx_gather", st(f"idx.{l}"), buf("block_table"), i32(max_pages), buf("seq_lens"),
+                 var(S), buf("kg"), buf("ksf"), buf("pick"), lane=1, after=[0])
         else:
             step(n + "prep", "mla_prep_shared", buf("qa"), i32(NA[True]), buf(n + "g_q"), buf(n + "g_kv"), buf("rope"),
                  buf("pos"), buf("slot_mapping"), kv, buf("qq"), buf("qsf"), i32(chunk), var(T))
@@ -420,10 +426,8 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
              rope=(buf("pos"), buf("rope")))
         if full:  # q's absorb beside the indexer
             step(n + "q_post", "q_post", buf("qb"), i32(NB[True]), buf("rope"), buf("pos"), buf("iq"), buf("iw"),
-                 buf("wout"), var(T))
+                 buf("wout"), var(T), after=[1])
             step(n + "uk", "uk", buf("qb"), buf(n + "wuk"), buf("qmla"), var(T), lane=1, after=[0])
-            step(n + "idx_gather", "idx_gather", st(f"idx.{l}"), buf("block_table"), i32(max_pages), buf("seq_lens"),
-                 var(S), buf("kg"), buf("ksf"), buf("pick"))
             for j in range(chunk // sub):
                 r0 = j * sub
                 step(f"{n}indexer.{j}", f"indexer.{j}", buf("iq", r0 * IQB), buf("kg"), buf("ksf"),
@@ -431,7 +435,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
                      buf("klen", r0 * 4), buf("logits"), buf("ind", r0 * G.TOPK * 4),
                      expr({"clamp": [T, r0, sub]}), var(CTX), expr({"mul": [{"ceil_div": [CTX, 256]}, 256]}),
                      buf("imeta", j * G.meta_words(sub) * 4), buf("ks" if fp8kv else "zero", r0 * 4), buf("tlen", r0 * 4),
-                     buf("pick"), var(T))
+                     buf("pick"))
             if not fp8kv:
                 step(n + "topk_slots", "topk_slots", buf("ind"), buf("block_table"), i32(max_pages), buf("row_seq"),
                      buf("klen"), buf("tlen"), var(T))
