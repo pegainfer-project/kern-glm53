@@ -58,12 +58,12 @@ using bf16 = cutlass::bfloat16_t;
     asm volatile("" ::"l"(p)); }
 
 // The routed gate-up GEMM at GLM_FP8_SWAP(BM, STAGES, 2, 256) with silu and e4m3 out (dg/glm_moe_gu_silu.cuh), its
-// glm::SiluSmem past the tile's 1024-aligned shared storage.
+// glm::SiluSmem past the tile's 1024-aligned shared storage; over 257 groups (the MoE) or one (the dense MLP).
 static_assert(sizeof(glm::SiluSmem) == 576);
-#define GLM_FP8_GU_SILU(BM, STAGES, SMEM)                                                                \
+#define GLM_FP8_GU_SILU(BM, GROUPS, STAGES, SMEM)                                                        \
   static_assert(SMEM % 1024 == 0);                                                                       \
   { auto p = reinterpret_cast<void*>(&glm_moe_gu_silu_impl<                                             \
-        cute::UMMA::Major::K, cute::UMMA::Major::K, 128, 128, 128, 0, 0, 0, BM, 128, 128, 257,          \
+        cute::UMMA::Major::K, cute::UMMA::Major::K, 128, 128, 128, 0, 0, 0, BM, 128, 128, GROUPS,       \
         128, 128, 128, STAGES, 2, 128, 128, 2, true, 152, true, false,                                   \
         GemmType::MGroupedContiguousWithPsumLayout, false, e4m3, e4m3, bf16,                            \
         epilogue::transform::EpilogueIdentity>);                                                        \
@@ -103,8 +103,10 @@ void glm_instantiate() {
   GLM_FP8_SWAP(64, 10, 2, 256, 224256)
   GLM_FP8_DN(128, 8, 214016)
   GLM_FP8_DN(256, 6, 215040)
-  GLM_FP8_GU_SILU(128, 8, 214016)
-  GLM_FP8_GU_SILU(256, 6, 215040)
+  GLM_FP8_GU_SILU(128, 257, 8, 214016)
+  GLM_FP8_GU_SILU(256, 257, 6, 215040)
+  GLM_FP8_GU_SILU(128, 1, 8, 214016)
+  GLM_FP8_GU_SILU(256, 1, 6, 215040)
   GLM_BF16(128, 128, 6, 230400)
   GLM_BF16(128, 256, 4, 230400)
   static_assert(sizeof(layout::MQALogitsSharedStorage<32, 128, false, 8, 256, 2, 4, 2, e4m3, __nv_bfloat16>) == 202752);

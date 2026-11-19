@@ -24,7 +24,8 @@ A layer, as vLLM runs GLM-5 (DeepSeek V3.2's sparse attention) on Blackwell with
     renormalized and scaled by 2.5, the routing tables (an expert's rows in token order), DeepGEMM's grouped fp8 GEMMs over
     each expert's rows only, the shared expert their group 0 over every row, one f32 sum.
 On a layer sharing the picks, the latent cache's lift (kv_dequant) runs on lane 1 (kern's program lanes)
-beside its query chain from q_b to uk, joined by the attention. q_pe's rope is q_b's epilogue's.
+beside its query chain from q_b to uk, joined by the attention. q_pe's rope is q_b's epilogue's; the dense MLP's
+gate-up is the routed one's (silu and the quantization in its epilogue) over one group of every row.
 Weights are the checkpoint's e4m3 tensors re-quantized to UE8M0 block scales while they load (the
 `derive` program, source/glm_prep.cu), the way vLLM prepares 128x128-block checkpoints for DeepGEMM
 on Blackwell.
@@ -88,15 +89,15 @@ def mla_entry():
 # the routed GEMMs' layout by row count (DeepGEMM's m-grouped choice: swap-AB, BN 128, a 2-CTA cluster), block M
 # 256 once an expert averages more than 128 rows
 MOE_TILES = "4096:s128,16384:s256"
+DENSE_GU = "512:s128,16384:s256"  # the dense MLP's gate-up, as MOE_TILES reads
 # the dense GEMMs' layouts by row count, as tile_ranges reads them (s: swap-AB with that block M on a 2-CTA
 # cluster, n: that BN, m: that BN (256 if none) on a 2-CTA cluster multicasting the weight tile): at few rows each
 # puts more CTAs on its weight (fp8.o at 128 rows: 96 tiles of 128 weight rows x 64 tokens, not 24 of 128 x 256);
 # from 257 rows the multicast halves the L2 traffic of the weight tiles that bound the plain BN 256 tile, its BN
 # the one whose tiles fill the 152 SMs' last wave best (q_a at 2048 rows: 16 x 19 tiles of BN 144 are two full
 # waves, 16 x 21 of BN 128 three with the last a fifth full)
-TILES = {"o": "256:s64,1024:m176,8192:m224,16384:m192", "dense.gu": "256:n,16384:m",
-         "dense.dn": "512:s64,16384:m224", "a.full": "256:n32,1024:m96,16384:m160",
-         "a.shared": "256:n32,1024:m96,16384:m144", "b.full": "256:n,16384:m", "b.shared": "256:n128,16384:m"}
+TILES = {"o": "256:s64,1024:m176,8192:m224,16384:m192", "dense.dn": "512:s64,16384:m224",
+         "a.full": "256:n32,1024:m96,16384:m160", "a.shared": "256:n32,1024:m96,16384:m144", "b.full": "256:n,16384:m", "b.shared": "256:n128,16384:m"}
 
 
 def moe_layouts(spec, chunk):
@@ -133,15 +134,13 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
                          ["in buffer<i64>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32"], [T, 1, 1], [256, 1, 1]),
         "plan": G.plain("glm_glue", "glm_plan",
                         ["in buffer<i64>", "in buffer<i32>", "i32", "out buffer<i32>", "out buffer<u32>",
-                         "out buffer<u32>", "out buffer<i32>", "out buffer<i32>", "out buffer<i32>", "i32"],
+                         "out buffer<u32>", "out buffer<i32>", "out buffer<i32>", "out buffer<i32>",
+                         "out buffer<i32>", "out buffer<i32>", "i32"],
                         [{"ceil_div": [T, 256]}, 1, 1], [256, 1, 1]),
         "gemm_bf16": {"params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32", "i32"],
                       "impl": {"launches": [{"entry": "extern:cublaslt_bf16_tn"}]}},
         "gemm_f32": {"params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32", "i32"],
                      "impl": {"launches": [{"entry": "extern:cublas_bf16_tn_f32"}]}},
-        "silu_dense": G.nulled("glm_glue", "glm_silu_mul_quant",
-                               ["in buffer<bf16>", "i32", "out buffer<u8>", "out buffer<u8>", "i32", "in buffer<i32>",
-                                "i32"], {5}, [{"mul": [T, DENSE_I // 1024]}, 1, 1], [256, 1, 1]),
         "q_post": G.plain("glm_glue", "glm_q_post",
                           ["in buffer<bf16>", "i32", "in buffer<bf16>", "in buffer<i32>", "out buffer<u8>",
                            "in buffer<bf16>", "out buffer<bf16>", "i32"], [T, 1, 1], [256, 1, 1]),
@@ -208,13 +207,15 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
         "b.full": (NB[True], QL, chunk, QL, NB[True], chunk, 1),
         "b.shared": (NB[False], QL, chunk, QL, NB[True], chunk, 1),
         "o": (H, HEADS * VD, chunk, HEADS * VD, H, chunk, 1),
-        "dense.gu": (2 * DENSE_I, H, chunk, H, 2 * DENSE_I, chunk, 1),
         "dense.dn": (H, DENSE_I, chunk, DENSE_I, H, chunk, 1),
         "moe.gu": (2 * INTER, H, mcap, H, 2 * INTER, mcap, GROUPS),
         "moe.dn": (H, INTER, mcap, INTER, H, mcap, GROUPS),
     }
     gu = [G.fp8_gu_silu(INTER, H, chunk, mcap, GROUPS, bm or 128, when=w) for w, bm in layouts]
     ops["fp8.moe.gu"] = {"params": gu[0][1], "impl": {"launches": [l for l, _ in gu]}}
+    # the dense MLP's gate-up: the same kernel over one group of every row (an identity row table)
+    gu = [G.fp8_gu_silu(DENSE_I, H, chunk, chunk, 1, bm or 128, when=w) for w, bm in moe_layouts(DENSE_GU, chunk)]
+    ops["fp8.dense.gu"] = {"params": gu[0][1], "impl": {"launches": [l for l, _ in gu]}}
     del gemms["moe.gu"]
     for k, a in gemms.items():
         if k.startswith("moe."):
@@ -297,13 +298,14 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
     once.call("fill_bf16", [buf("rs"), i32(1), {"f32": 2.5}], 1)
 
     for name, w in (("res", H), ("h", H), ("xn", H), ("qa", NA[True]), ("qb", NB[True]), ("qmla", HEADS * KVL),
-                    ("o", HEADS * KVL), ("dg", 2 * DENSE_I)):
+                    ("o", HEADS * KVL)):
         work(name, [T, w])
     for name, w in (("xq", H), ("qq", QL), ("iq", IQB), ("oq", HEADS * VD), ("dq", DENSE_I)):
         work(name, [T, w], "u8")
     for name, k in (("xsf", H), ("qsf", QL), ("osf", HEADS * VD), ("dsf", DENSE_I)):
         work(name, [sf_bytes(k, chunk)], "u8")
-    for name in ("pos", "klen", "row_seq", "zero", "tlen"):
+    work("srows", [1], "i32")
+    for name in ("pos", "klen", "row_seq", "zero", "tlen", "ident"):
         work(name, [T], "i32")
     for name in ("ks", "ke"):
         work(name, [T], "u32")
@@ -350,7 +352,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
 
     def plan(l):
         step(f"L{l}.plan", "plan", buf("cu_seqlens"), buf("seq_lens"), var(S), buf("pos"), buf("ks"), buf("ke"),
-             buf("klen"), buf("row_seq"), buf("zero"), var(T))
+             buf("klen"), buf("row_seq"), buf("zero"), buf("ident"), buf("srows"), var(T))
 
     plan(first)
     step("embed", "embed", buf("token_ids"), buf("embed"), buf("res"), var(T), i32(H))
@@ -452,12 +454,12 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
         # MLP
         if l < DENSE:
             fp8_weight(n + "w_gu", 2 * DENSE_I, H)
-            requant(n + "w_gu", 2 * DENSE_I, mlp + "gate_proj", DENSE_I, H)
-            requant(n + "w_gu", 2 * DENSE_I, mlp + "up_proj", DENSE_I, H, row0=DENSE_I)
+            requant(n + "w_gu", 2 * DENSE_I, mlp + "gate_proj", DENSE_I, H, tiled=True)
+            requant(n + "w_gu", 2 * DENSE_I, mlp + "up_proj", DENSE_I, H, row0=DENSE_I, tiled=True)
             fp8_weight(n + "w_dn", H, DENSE_I)
             requant(n + "w_dn", H, mlp + "down_proj", H, DENSE_I)
-            gemm(n + "gu", "dense.gu", "xq", n + "w_gu", "dg")
-            step(n + "silu", "silu_dense", buf("dg"), i32(DENSE_I), buf("dq"), buf("dsf"), i32(chunk), var(T))
+            step(n + "gu", "fp8.dense.gu", buf("xq"), buf(n + "w_gu"), buf("xsf"), buf(n + "w_gu.sf"), buf("dq"),
+                 buf("dsf"), buf("srows"), buf("ident"))
             gemm(n + "dn", "dense.dn", "dq", n + "w_dn", "h", a_sf="dsf")
             continue
         weight(n + "w_r", [EXPERTS, H], [seg(mlp + "gate.weight")])

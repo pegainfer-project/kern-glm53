@@ -34,6 +34,7 @@ checkpoint (GLM-5.2-FP8 has the same tensors).
 - **MoE.** Routing tables over the router's top-8 (an expert's rows in token order), then DeepGEMM's
   m-grouped fp8 GEMM in its psum layout, so only each expert's own row blocks run; the gate-up GEMM gathers
   its rows from the tokens itself, and its epilogue applies silu and quantizes the activation for the down GEMM.
+  The dense MLP's gate-up (layers 0-2) runs the same kernel over one group of all the rows.
 
 ## Kernels
 

@@ -104,14 +104,17 @@ __device__ __forceinline__ void st4(bf16* p, const float v[4]) {
 
 // A row's sequence, position and indexer bounds. seq_lens are the sequences' lengths with this
 // chunk's rows; the indexer's keys are gathered sequence after sequence (glm_idx_gather), so row r
-// scores keys [ks, ke) of that stream and klen = ke - ks of them.
+// scores keys [ks, ke) of that stream and klen = ke - ks of them. ident[r] = r and rows[0] = T: the dense
+// MLP's row table and group size for its one-group gate-up.
 //   grid (ceil(T / 256)), block 256
 extern "C" __global__ void glm_plan(const long long* __restrict__ cu, const int* __restrict__ seq_lens, int nseq,
                                     int* __restrict__ pos, unsigned* __restrict__ ks, unsigned* __restrict__ ke,
                                     int* __restrict__ klen, int* __restrict__ row_seq, int* __restrict__ zero,
-                                    int T) {
+                                    int* __restrict__ ident, int* __restrict__ rows, int T) {
   const int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r == 0) rows[0] = T;
   if (r >= T) return;
+  ident[r] = r;
   int s = 0;
   unsigned goff = 0;
   while (s + 1 < nseq && cu[s + 1] <= r) goff += seq_lens[s++];
@@ -257,56 +260,6 @@ extern "C" __global__ void __launch_bounds__(256) glm_add_rms_quant(
     u8* __restrict__ q, u8* __restrict__ sf, int sf_rows, int T) {
   asm volatile("griddepcontrol.launch_dependents;");
   norm_row(blockIdx.x, a, res, gamma, normed, q, sf, sf_rows);
-}
-
-// act = bf16(silu(g) * u) over gate | up halves of gu [rows, 2I], quantized per 128 columns into
-// q [rows, I]. `n` (may be null) holds the live row count; rows past it are skipped.
-//   grid (ceil(rows * I / 1024)), block 256
-extern "C" __global__ void glm_silu_mul_quant(const bf16* __restrict__ gu, int I, u8* __restrict__ q,
-                                              u8* __restrict__ sf, int sf_rows, const int* __restrict__ n,
-                                              int rows) {
-  const long long gw = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-  const int nb = I >> 7;
-  if (gw >= (long long)rows * nb) return;
-  const int r = (int)(gw / nb), kb = (int)(gw % nb), c = kb * 128 + (threadIdx.x & 31) * 4;
-  if (n && r >= *n) return;
-  float g[4], u[4], v[4];
-  ld4(gu + (size_t)r * 2 * I + c, g);
-  ld4(gu + (size_t)r * 2 * I + I + c, u);
-#pragma unroll
-  for (int j = 0; j < 4; ++j) v[j] = rnd(g[j] / (1.f + __expf(-g[j])) * u[j]);
-  quant4(v, q + (size_t)r * I + c, sf, sf_rows, r, kb, 1e-10f);
-}
-
-// glm_silu_mul_quant at I = 2048, a block per row, eight columns a thread: row r of gu at map[r] (map null:
-// r itself; a negative entry is skipped), so the routed rows run at exp2perm's permuted rows only.
-//   grid (rows), block 256
-extern "C" __global__ void __launch_bounds__(256) glm_silu_rows(const bf16* __restrict__ gu,
-                                                                const int* __restrict__ map, u8* __restrict__ q,
-                                                                u8* __restrict__ sf, int sf_rows) {
-  constexpr int I = 2048;
-  const int r = map ? map[blockIdx.x] : blockIdx.x, c = threadIdx.x * 8;
-  if (r < 0) return;
-  const uint4 gw = *reinterpret_cast<const uint4*>(gu + (size_t)r * 2 * I + c);
-  const uint4 uw = *reinterpret_cast<const uint4*>(gu + (size_t)r * 2 * I + I + c);
-  const __nv_bfloat162* g2 = reinterpret_cast<const __nv_bfloat162*>(&gw);
-  const __nv_bfloat162* u2 = reinterpret_cast<const __nv_bfloat162*>(&uw);
-  float v[8], amax = 0.f;
-#pragma unroll
-  for (int j = 0; j < 4; ++j) {
-    const float2 g = __bfloat1622float2(g2[j]), u = __bfloat1622float2(u2[j]);
-    v[2 * j] = rnd(g.x / (1.f + __expf(-g.x)) * u.x);
-    v[2 * j + 1] = rnd(g.y / (1.f + __expf(-g.y)) * u.y);
-    amax = fmaxf(amax, fmaxf(fabsf(v[2 * j]), fabsf(v[2 * j + 1])));
-  }
-#pragma unroll
-  for (int o = 8; o; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-  u8 e;
-  const float inv = 1.f / ue8m0(amax, 1e-10f, &e);
-  const uint2 out = make_uint2(fp8x4(v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv),
-                               fp8x4(v[4] * inv, v[5] * inv, v[6] * inv, v[7] * inv));
-  *reinterpret_cast<uint2*>(q + (size_t)r * I + c) = out;
-  if ((threadIdx.x & 15) == 0) put_sf(sf, sf_rows, r, threadIdx.x >> 4, e);
 }
 
 // The projection [q_a 2048 | kv_a 512 | k_pe 64 | wk 128] of a row (bf16, lda apart):

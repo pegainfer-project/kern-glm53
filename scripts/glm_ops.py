@@ -139,17 +139,17 @@ GU_SILU_ENTRY = ("_ZN9deep_gemm20glm_moe_gu_silu_implILN4cute4UMMA5MajorE0ELS3_0
 SILU_SMEM = 576  # sizeof(glm::SiluSmem)
 
 
-def fp8_gu_silu(inter, k, x_rows, rows, groups, bm, when=None):
+def fp8_gu_silu(inter, k, x_rows, rows, groups, bm, when=None, sfa_rows=None):
     """The routed gate-up GEMM (swap-AB at block M `bm`, BN 128, a 2-CTA cluster) over the tokens' rows, which a warp
     of its own gathers through the routing's row table, with act = bf16(silu(gate) * up) quantized per 128 columns in
     its epilogue (source/dg/glm_moe_gu_silu.cuh). Interface: x [x_rows, k] e4m3, w ([gate; up] of `inter` rows each, a group
     apart), sfa (the routed rows' scales), sfb, act [rows, inter] e4m3 out, its packed UE8M0 scales out, psum,
-    the row table [rows]."""
-    n, kw = 2 * inter, k // 512
+    the row table [rows]. sfa has `sfa_rows` (default `rows`) a word row."""
+    n, kw, sfa_rows = 2 * inter, k // 512, sfa_rows or rows
     stages, smem = FP8_SWAP_TILE[bm]
     maps = [desc(tm(0, 0, "u8", [k, x_rows], [k], [128, 1], 128)),
             desc(tm(0, 1, "u8", [128, 64, n * groups // 64 * (k // 128)], [128, 8192], [128, 64, 1], 128)),
-            desc(tm(0, 2, "i32", [rows, kw], [rows * 4], [-(-bm // 128) * 128, 1])),
+            desc(tm(0, 2, "i32", [sfa_rows, kw], [sfa_rows * 4], [-(-bm // 128) * 128, 1])),
             desc(tm(0, 3, "i32", [n, kw * groups], [n * 4], [64, 1])),
             desc(tm(0, 4, "u8", [inter, rows], [inter], [64, 16]))]
     l = launch("glm_deepgemm", GU_SILU_ENTRY.format(bm=bm, groups=groups, stages=stages), [SMS, 1, 1], [256, 1, 1],
