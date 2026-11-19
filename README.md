@@ -20,8 +20,8 @@ checkpoint (GLM-5.2-FP8 has the same tensors).
 ![the climb](loop/climb.svg)
 
 Mean TTFT over the AgentX corpus on an idle PP4, every optimization a commit on `main`: short prefills on a
-long context, long prefills and all, -24.5% / -22.7% / -24.2% from row 0, each landing through the numerics gate
-(78 layers against SGLang's fp8-KV run: top-1 95.22% at row 0, 95.28% at row 47). The rows, how each was
+long context, long prefills and all, as % of row 0 (the chart's top line has the latest), each landing through the
+numerics gate (78 layers against SGLang's fp8-KV run: top-1 95.22% at row 0, 95.28% at row 47). The rows, how each was
 measured and the checkpoints are in [loop/HISTORY.md](loop/HISTORY.md); the loop that made them (agents,
 gates, tools) is [loop/TASK.md](loop/TASK.md).
 
