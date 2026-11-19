@@ -560,7 +560,12 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
         // Producer warp for KV
         cutlass::arch::warpgroup_reg_dealloc<56>();
         int warp_idx = cutlass::canonical_warp_idx_sync() - 4;
-        constexpr int NUM_WARPS = 4, NUM_LOCAL_ROWS_PER_WARP = (B_TOPK/4)/NUM_WARPS;
+        // Warps 5-7 gather a block's 16 groups of 4 keys (group r is warp 5 + r % 3's): a TMA instruction holds its
+        // SM sub-partition's MIO pipe for ~32 cycles, and warp 4 shares sub-partition 0 with the MMA warp
+        constexpr int NUM_GROUPS_KEYS = B_TOPK/4, NUM_TMA_WARPS = 3;
+        constexpr int NUM_LOCAL_ROWS_PER_WARP = (NUM_GROUPS_KEYS + NUM_TMA_WARPS - 1)/NUM_TMA_WARPS;
+        const int tma_warp = warp_idx - 1;
+        const int num_my_rows = tma_warp < 0 ? 0 : (NUM_GROUPS_KEYS - tma_warp + NUM_TMA_WARPS - 1)/NUM_TMA_WARPS;
         run_outer_loop([&](const OuterloopArgs &args) {
             if (elect_one_sync()) {
                 int* gIndices = params.indices + args.s_q_idx*params.stride_indices_s_q; // [topk]
@@ -570,9 +575,11 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                     int max_indices = -1, min_indices = params.s_kv;
                     CUTE_UNROLL
                     for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
-                        indices[local_row] = __ldg((int4*)(gIndices + k*B_TOPK) + local_row*NUM_WARPS + warp_idx);
-                        max_indices = max(max_indices, int4_max(indices[local_row]));
-                        min_indices = min(min_indices, int4_min(indices[local_row]));
+                        if (local_row < num_my_rows) {
+                            indices[local_row] = __ldg((int4*)(gIndices + k*B_TOPK) + tma_warp + local_row*NUM_TMA_WARPS);
+                            max_indices = max(max_indices, int4_max(indices[local_row]));
+                            min_indices = min(min_indices, int4_min(indices[local_row]));
+                        }
                     }
                     bool is_all_rows_invalid = min_indices == params.s_kv || max_indices == -1;
                     bool should_skip_tma = is_all_rows_invalid && k >= NUM_BUFS;    // Don't skip TMA for the first NUM_BUFS turns to swipe out invalid values in kv buffer
@@ -588,17 +595,19 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                     // Copy NoPE
                     auto [buf_idx, bar_phase] = rs.get<NUM_BUFS>();
                     plan.bar_sv_lo_done[buf_idx].wait(bar_phase^1);
-                    bf16* sK_nope_base = plan.u.qko_slots[buf_idx].data() + warp_idx*4*64;
+                    bf16* sK_nope_base = plan.u.qko_slots[buf_idx].data() + tma_warp*4*64;
     
                     auto load_kv_nope_part = [&](int part_idx) {
                         CUTE_UNROLL
                         for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
+                            if (local_row >= num_my_rows)
+                                break;
                             CUTE_UNROLL
                             for (int local_col = part_idx*(D_V/2/64); local_col < (part_idx+1)*(D_V/2/64); ++local_col) {
                                 ku::tma_gather4(
                                     &(tma_params.tensor_map_kv_nope),
                                     plan.bar_kv_nope_ready[buf_idx][part_idx],
-                                    sK_nope_base + local_row*(4*NUM_WARPS)*64 + local_col*(B_TOPK*64),
+                                    sK_nope_base + local_row*(4*NUM_TMA_WARPS)*64 + local_col*(B_TOPK*64),
                                     local_col*64,
                                     indices[local_row],
                                     (int64_t)TMA::CacheHintSm90::EVICT_LAST
@@ -607,7 +616,8 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                         }
                     };
     
-                    if (!should_skip_tma) {
+                    if (num_my_rows == 0) {
+                    } else if (!should_skip_tma) {
                         load_kv_nope_part(0);
                         plan.bar_sv_done[buf_idx].wait(bar_phase^1);
                         load_kv_nope_part(1);
@@ -615,7 +625,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                         // NOTE See head128/phase1.cuh for this TMA skipping technique
                         CUTE_UNROLL
                         for (int part_idx = 0; part_idx < 2; ++part_idx)
-                            plan.bar_kv_nope_ready[buf_idx][part_idx].complete_transaction(NUM_LOCAL_ROWS_PER_WARP*4*D_V/2*sizeof(bf16));
+                            plan.bar_kv_nope_ready[buf_idx][part_idx].complete_transaction(num_my_rows*4*D_V/2*sizeof(bf16));
                     }
 
                     rs.update();

@@ -40,5 +40,9 @@ warpgroup (512 threads): thread (lane quadrant q, group g) holds head (q & 1) * 
   commits the first half on its own barrier, `bar_sv_lo_done`: the producer gathers the next block's first
   256 dims into that buffer while the second half still runs.
 
+- K's TMA gathers go out from producer warps 5-7 (a block's 16 groups of four keys, group r warp 5 + r % 3's);
+  warp 4 issues none. A gather4 holds its SM sub-partition's MIO pipe ~32 cycles at issue, and warp 4 sits on
+  sub-partition 0 with the MMA warp, whose S V GEMM issue waited behind them.
+
 The products, S, `li` and the outputs are upstream's, bit for bit; an exponential whose result would be
 subnormal (below 2^-126) is 0 here.
