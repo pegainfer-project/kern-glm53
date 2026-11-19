@@ -60,7 +60,7 @@ sha256 = "113203bd3e74a441e4424282386b75ded4b5dfd74669ba1426a3135744a3f26e"
 source = "source/glm_topk.cu"
 
 [kernels."glm_glue"]
-sha256 = "b8723ad41eb73d0c0ec472e419db853f6dd405e18b2b2080272fa8e7ad261aa3"
+sha256 = "5ebb58c42728145309507a419cee97879a62c6ade9a1e2b283b3d154ece90ba1"
 source = "source/glm_glue.cu"
 
 [kernels."glm_moe"]
@@ -84,6 +84,13 @@ sha256 = "448042b7f709b3a6b31ad8fcffcf7871b7e02ab0c12e5ced9fbee57ed03e4523"
 source = "source/k3/copy_rows.cu"
 
 # DeepGEMM sm100 fp8 Normal GEMM, swap-AB on a 2-CTA cluster: the projections at few rows.
+# q_b with q_pe's rope in its epilogue, the layers sharing the picks (source/glm_qb_rope.cu).
+[kernels."glm_qb_rope"]
+sha256 = "ed54a987f3355925a0087f04a22f1eb3ad4e451a3483a1f063a7b490167d115e"
+source = "source/glm_qb_rope.cu"
+flags = "deepgemm"
+includes = ["deepgemm"]
+
 [kernels."glm_fp8_tiles"]
 sha256 = "afb41f7a951f0c5b763334737fc81c279ab34bb555e9279cbb68727a7b258ada"
 source = "source/glm_fp8_tiles.cu"

@@ -371,36 +371,17 @@ extern "C" __global__ void __launch_bounds__(256) glm_mla_prep_fp8(MLA_PREP_ARGS
   mla_prep<true>(x, lda, g_q, g_kv, rope, pos, slot, kv, idx, ik_w, ik_b, qq, qsf, sf_rows);
 }
 
-// After q_b: the rope of q_pe into the tail of the absorbed query qmla [T, 64, 576], and on full
-// layers the indexer query (rope on its first 64 dims, e4m3 per (row, head)) with its head weight
+// After q_b on a layer with an indexer (q_pe's rope is q_b's epilogue's, source/glm_qb_rope.cu): the indexer
+// query (rope on its first 64 dims, e4m3 per (row, head)) with its head weight
 // w = bf16(f32(iw) * scale * 128^-0.5 * 32^-0.5). qb [T, ldb]: 64 heads of nope 192 | pe 64, then the
 // indexer's 32 heads of 128 at column 16384.
 //   grid (T), block 256
 extern "C" __global__ void __launch_bounds__(256) glm_q_post(
     const bf16* __restrict__ qb, int ldb, const bf16* __restrict__ rope, const int* __restrict__ pos,
-    bf16* __restrict__ qmla, u8* __restrict__ iq, const bf16* __restrict__ iw, bf16* __restrict__ wout, int full,
-    int T) {
+    u8* __restrict__ iq, const bf16* __restrict__ iw, bf16* __restrict__ wout, int T) {
   const int r = blockIdx.x, t = threadIdx.x, w = t >> 5, l = t & 31;
   const bf16* row = qb + (size_t)r * ldb;
   const bf16* cs = rope + (size_t)pos[r] * 2 * HALF;
-#pragma unroll
-  for (int k = 0; k < 2; ++k) {
-    const int i = t + k * 256, h = i >> 3, pr = (i & 7) * 4;
-    const uint4 u = *reinterpret_cast<const uint4*>(row + h * QHD + NOPE + 2 * pr);
-    const __nv_bfloat162* x = reinterpret_cast<const __nv_bfloat162*>(&u);
-    float c[4], sn[4];
-    ld4(cs + pr, c);
-    ld4(cs + HALF + pr, sn);
-    __nv_bfloat162 o[4];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      const float2 v = __bfloat1622float2(x[j]);
-      o[j] = __floats2bfloat162_rn(v.x * c[j] - v.y * sn[j], v.y * c[j] + v.x * sn[j]);
-    }
-    *reinterpret_cast<uint4*>(qmla + ((size_t)r * HEADS + h) * MLA + KVL + 2 * pr) =
-        *reinterpret_cast<const uint4*>(o);
-  }
-  if (!full) return;
 #pragma unroll
   for (int k = 0; k < 4; ++k) {
     const int ih = w * 4 + k;

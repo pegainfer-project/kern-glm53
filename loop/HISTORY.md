@@ -79,3 +79,4 @@ sub-model -0.04% (graph -0.40%).
 | 41 | b50c880 | from 32k keys of context the indexer's logits read a split once for a 16-row q block | 207.20 | 958.29 | 236.62 | -0.14% | 460 | top-1 100.000% · flips 0 (confident 0) |
 | 42 | 8e4cee5 | the indexer's top-k samples a row of 32k to 96k keys for 1.75 x 2048 candidates | 206.88 | 957.77 | 236.35 | -0.11% | 460 | top-1 100.000% · flips 0 (confident 0) |
 | 43 | 435ddea | the top-k's sample counts its rest only at or above a floor its first eighth puts | 206.52 | 956.35 | 235.95 | -0.17% | 460 | top-1 100.000% · flips 0 (confident 0) |
+| 44 | 05b7d35 | q_pe's rope in q_b's epilogue | 206.07 | 954.89 | 235.46 | -0.21% | 454 | top-1 100.000% · flips 0 (confident 0) |

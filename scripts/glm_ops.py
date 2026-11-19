@@ -69,7 +69,7 @@ FP8_ENTRY = ("_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0EL
 
 
 def fp8_gemm(n, k, rows, lda, ldc, sfa_rows, groups=1, bn=None, swap_bm=None, mcb=False, acc=False, when=None,
-             tiled=False):
+             tiled=False, rope=False):
     """C[m, :n] (rows ldc apart) = A[m, :k] (lda apart) . W[n, k]^T with both operands' block scales.
     Interface: a, w, sfa, sfb, c, then m (dense) or the psum offsets of `groups` experts (grouped:
     expert g's rows end at psum[g] and start at the previous end rounded up to the block M, its weight
@@ -79,7 +79,9 @@ def fp8_gemm(n, k, rows, lda, ldc, sfa_rows, groups=1, bn=None, swap_bm=None, mc
     `mcb`: that BN on a 2-CTA cluster along M multicasting the weight tile (source/glm_fp8_tiles.cu); the
     pair needs an even count of 128-row blocks (DeepGEMM's multicast legality), so it runs m rounded up to
     256 rows, its extra rows inside the `rows` the maps span and read by no one.
-    `acc` (swap_bm 64 or mcb): C += the product, the bf16 rounded product added by a TMA reduce-add."""
+    `acc` (swap_bm 64 or mcb): C += the product, the bf16 rounded product added by a TMA reduce-add.
+    `rope` (q_b, BN 128 / 256 or mcb 256): each of the 64 heads' last 64 of 256 columns rotated by the row's
+    position (source/glm_qb_rope.cu); two more interface params, the positions and the rope table."""
     grouped = groups > 1
     kw = k // 512
     if swap_bm:
@@ -101,9 +103,13 @@ def fp8_gemm(n, k, rows, lda, ldc, sfa_rows, groups=1, bn=None, swap_bm=None, mc
     assert not tiled or (swap_bm and grouped), "tile-major weights only on the grouped swap-AB copy"
     if tiled:
         entry = entry.replace("28sm100_fp8_fp4_gemm_1d1d_impl", "15glm_moe_dn_impl")
+    assert not rope or not grouped and not acc and bn in ((256,) if mcb else (128, 256)), "q_b's rope layouts"
+    if rope:
+        entry = entry.replace("9transform16EpilogueIdentityEEEvPijjjT28_14CUtensorMap_stSD_SD_SD_SD_",
+                              "8GlmRopeQEEEvPijjjT28_14CUtensorMap_stSC_SC_SC_SC_")
     params = ["in buffer<u8>", "in buffer<fp8e4m3>", "in buffer<u8>", "in buffer<u8>",
               "inout buffer<bf16>" if acc else "out buffer<bf16>",
-              "in buffer<i32>" if grouped else "i32"]
+              "in buffer<i32>" if grouped else "i32", *(["in buffer<i32>", "in buffer<bf16>"] if rope else [])]
     maps = [desc(tm(0, 0, "u8", [k, rows], [lda], a_box, 128)),
             desc(tm(0, 1, "u8", [128, 64, n * groups // 64 * (k // 128)], [128, 8192], [128, 64, 1], 128) if tiled else
                  tm(0, 1, "u8", [k, n * groups], [k], [128, bn // 2 if mcb else bn], 128)),
@@ -119,9 +125,11 @@ def fp8_gemm(n, k, rows, lda, ldc, sfa_rows, groups=1, bn=None, swap_bm=None, mc
     extra = {"cluster": [mc, 1, 1]} if mc > 1 else {}
     if when:
         extra["when"] = when
-    mod = "glm_fp8_tiles" if (swap_bm and not grouped) or mcb else "glm_deepgemm"
+    mod = "glm_qb_rope" if rope else "glm_fp8_tiles" if (swap_bm and not grouped) or mcb else "glm_deepgemm"
+    epi = {"pack": {"size": 24, "fields": [{"at": 0, "param": 6}, {"at": 8, "var": T}, {"at": 12, "param": 7},
+                                           {"at": 20, "f32": 1.0}]}} if rope else EPILOGUE
     return launch(mod, entry, [SMS, 1, 1], [256, 1, 1], smem, params=kparams,
-                  args=[*head, {"i32": n}, {"i32": k}, EPILOGUE, *maps], pdl=True, **extra), params
+                  args=[*head, {"i32": n}, {"i32": k}, epi, *maps], pdl=True, **extra), params
 
 
 GU_SILU_ENTRY = ("_ZN9deep_gemm20glm_moe_gu_silu_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj128ELj128ELj0ELj0ELj0ELj{bm}"
@@ -281,9 +289,9 @@ def indexer(j, r, kv_cap, pick_rows):
 SCALE = 256 ** -0.5  # qk_nope 192 + rope 64
 
 
-def flash_mla(rows, entry, kv):
-    """`entry` is read off the cubin: its mangled TmaParams type runs to 1.5 KB. Interface: q [., 64, 576], q again
-    (its rope view, offset 1024 bytes), kv [row][576] bf16 (`kv` its param type: the cache state, or the lifted
+def flash_mla(rows, entry, kv, qb_row):
+    """`entry` is read off the cubin: its mangled TmaParams type runs to 1.5 KB. Interface: q's latent half
+    [., 64, 512], its rope half (q_b's output past each head's nope, read through its TMA map only), kv [row][576] bf16 (`kv` its param type: the cache state, or the lifted
     stream), ind [., 2048] rows of kv (-1 masked), tlen [.], o [., 64, 512] out, max_logits, lse [., 64] f32 out."""
     i32 = lambda at, v: {"at": at, "i32": v}
     f32 = lambda at, v: {"at": at, "f32": v}
@@ -296,9 +304,9 @@ def flash_mla(rows, entry, kv):
         ptr(104, 5), ptr(112, 6), ptr(120, 7), i32(128, SMS)]}}
     tma = {"pack": {"size": 1280, "fields": [
         i32(0x0, 64), i32(0x4, 512), s_q(0x8),
-        tm(0x80, 0, "bf16", [512, 64, rows], [1152, 64 * 1152], [64, 64, 1], 128, 128),
+        tm(0x80, 0, "bf16", [512, 64, rows], [1024, 64 * 1024], [64, 64, 1], 128, 128),
         i32(0x180, 64), i32(0x184, 64), s_q(0x188),
-        tm(0x200, 1, "bf16", [64, 64, rows], [1152, 64 * 1152], [32, 64, 1], 64, 128),
+        tm(0x200, 1, "bf16", [64, 64, rows], [512, qb_row], [32, 64, 1], 64, 128),
         i32(0x300, 64), i32(0x304, 512), s_q(0x308),
         tm(0x380, 5, "bf16", [512, 64, rows], [1024, 64 * 1024], [64, 64, 1], 128, 128),
         tm(0x480, 2, "bf16", [512, 0], [1152], [64, 1], 128, 256)]}}

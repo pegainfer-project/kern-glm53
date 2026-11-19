@@ -24,7 +24,7 @@ A layer, as vLLM runs GLM-5 (DeepSeek V3.2's sparse attention) on Blackwell with
     renormalized and scaled by 2.5, the routing tables (an expert's rows in token order), DeepGEMM's grouped fp8 GEMMs over
     each expert's rows only, the shared expert their group 0 over every row, one f32 sum.
 On a layer sharing the picks, the latent cache's lift (kv_dequant) runs on lane 1 (kern's program lanes)
-beside its query chain from q_b to q_post, joined by the attention.
+beside its query chain from q_b to uk, joined by the attention. q_pe's rope is q_b's epilogue's.
 Weights are the checkpoint's e4m3 tensors re-quantized to UE8M0 block scales while they load (the
 `derive` program, source/glm_prep.cu), the way vLLM prepares 128x128-block checkpoints for DeepGEMM
 on Blackwell.
@@ -142,13 +142,9 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
         "silu_dense": G.nulled("glm_glue", "glm_silu_mul_quant",
                                ["in buffer<bf16>", "i32", "out buffer<u8>", "out buffer<u8>", "i32", "in buffer<i32>",
                                 "i32"], {5}, [{"mul": [T, DENSE_I // 1024]}, 1, 1], [256, 1, 1]),
-        "q_post_full": G.plain("glm_glue", "glm_q_post",
-                               ["in buffer<bf16>", "i32", "in buffer<bf16>", "in buffer<i32>", "out buffer<bf16>",
-                                "out buffer<u8>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32"], [T, 1, 1], [256, 1, 1]),
-        "q_post_shared": G.nulled("glm_glue", "glm_q_post",
-                                  ["in buffer<bf16>", "i32", "in buffer<bf16>", "in buffer<i32>", "inout buffer<bf16>",
-                                   "out buffer<u8>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32"], {5, 6, 7},
-                                  [T, 1, 1], [256, 1, 1]),
+        "q_post": G.plain("glm_glue", "glm_q_post",
+                          ["in buffer<bf16>", "i32", "in buffer<bf16>", "in buffer<i32>", "out buffer<u8>",
+                           "in buffer<bf16>", "out buffer<bf16>", "i32"], [T, 1, 1], [256, 1, 1]),
         "idx_gather": G.plain("glm_glue", "glm_idx_gather",
                               ["in state", "in buffer<i32>", "i32", "in buffer<i32>", "i32", "out buffer<u8>",
                                "out buffer<f32>", "out buffer<u8>"], [{"add": [{"ceil_div": [CTX, PAGE]}, S]}, 1, 1],
@@ -161,9 +157,9 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
                                 "out buffer<bf16>"], 5, [{"add": [{"ceil_div": [CTX, PAGE]}, S]}, 1, 1], [256, 1, 1],
                                PICK_ROWS),
         "uk": G.bf16_batched(KVL, NOPE, chunk, (NB[True] * 2, (NOPE + ROPE) * 2), (NOPE * 2, KVL * NOPE * 2),
-                             (HEADS * MLA * 2, MLA * 2)),
+                             (HEADS * KVL * 2, KVL * 2)),
         "uv": G.vup_quant(VD, KVL, chunk, (HEADS * KVL * 2, KVL * 2), (KVL * 2, (NOPE + VD) * KVL * 2)),
-        "flash_mla": G.flash_mla(chunk, mla_entry(), "in buffer<bf16>" if fp8kv else "in state"),
+        "flash_mla": G.flash_mla(chunk, mla_entry(), "in buffer<bf16>" if fp8kv else "in state", NB[True] * 2),
         "router_topk": {"params": ["in buffer<f32>", "in buffer<f32>", "in buffer<bf16>", "out buffer<i32>",
                                    "out buffer<f32>", "i32"],
                         "impl": {"launches": [{**module("k3_router_argmax", EXPERTS=EXPERTS, TOPK=TOPK),
@@ -226,7 +222,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
             ops["fp8." + k] = {"params": ls[0][1], "impl": {"launches": [l for l, _ in ls]}}
         elif k in TILES:
             ls = [G.fp8_gemm(*a, **({"swap_bm": t} if kind == "s" else {"mcb": t or 256} if kind == "m" else {"bn": t}),
-                             acc=k == "o", when=w)
+                             acc=k == "o", rope=k.startswith("b."), when=w)
                   for kind, w, t in tile_ranges(TILES[k], chunk)]
             ops["fp8." + k] = {"params": ls[0][1], "impl": {"launches": [l for l, _ in ls]}}
         else:
@@ -300,7 +296,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
     carry("rs", [1])
     once.call("fill_bf16", [buf("rs"), i32(1), {"f32": 2.5}], 1)
 
-    for name, w in (("res", H), ("h", H), ("xn", H), ("qa", NA[True]), ("qb", NB[True]), ("qmla", HEADS * MLA),
+    for name, w in (("res", H), ("h", H), ("xn", H), ("qa", NA[True]), ("qb", NB[True]), ("qmla", HEADS * KVL),
                     ("o", HEADS * KVL), ("dg", 2 * DENSE_I)):
         work(name, [T, w])
     for name, w in (("xq", H), ("qq", QL), ("iq", IQB), ("oq", HEADS * VD), ("dq", DENSE_I)):
@@ -347,10 +343,10 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
         prog.append({"label": label, "op": op, "args": list(args), **({"lane": lane} if lane else {}),
                      **({"after": list(after)} if after else {})})
 
-    def gemm(label, key, a, w, c, m=var(T), a_sf="xsf", **lanes):
+    def gemm(label, key, a, w, c, m=var(T), a_sf="xsf", rope=(), **lanes):
         grouped = key.startswith("moe.")
         step(label, "fp8." + key, buf(a), buf(w), buf(a_sf), buf(w + ".sf"), buf(c), buf("psum") if grouped else m,
-             **lanes)
+             *rope, **lanes)
 
     def plan(l):
         step(f"L{l}.plan", "plan", buf("cu_seqlens"), buf("seq_lens"), var(S), buf("pos"), buf("ks"), buf("ke"),
@@ -418,10 +414,11 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
         if fp8kv and not full:  # the picks are the last indexer layer's: the lift runs beside the query chain
             step(n + "kv_dequant", "kv_dequant", kv, buf("block_table"), i32(max_pages), buf("seq_lens"), var(S),
                  buf("pick"), buf("kvd"), lane=1, after=[0])
-        gemm(n + "b", "b.full" if full else "b.shared", "qq", n + "w_b", "qb", a_sf="qsf")
-        if full:  # q's absorb (qmla's latent half; q_post writes its rope half) beside the indexer
-            step(n + "q_post", "q_post_full", buf("qb"), i32(NB[True]), buf("rope"), buf("pos"), buf("qmla"), buf("iq"),
-                 buf("iw"), buf("wout"), i32(1), var(T))
+        gemm(n + "b", "b.full" if full else "b.shared", "qq", n + "w_b", "qb", a_sf="qsf",
+             rope=(buf("pos"), buf("rope")))
+        if full:  # q's absorb beside the indexer
+            step(n + "q_post", "q_post", buf("qb"), i32(NB[True]), buf("rope"), buf("pos"), buf("iq"), buf("iw"),
+                 buf("wout"), var(T))
             step(n + "uk", "uk", buf("qb"), buf(n + "wuk"), buf("qmla"), var(T), lane=1, after=[0])
             step(n + "idx_gather", "idx_gather", st(f"idx.{l}"), buf("block_table"), i32(max_pages), buf("seq_lens"),
                  var(S), buf("kg"), buf("ksf"), buf("pick"))
@@ -438,12 +435,10 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
                      buf("klen"), buf("tlen"), var(T))
         else:
             step(n + "uk", "uk", buf("qb"), buf(n + "wuk"), buf("qmla"), var(T))
-            step(n + "q_post", "q_post_shared", buf("qb"), i32(NB[True]), buf("rope"), buf("pos"), buf("qmla"),
-                 i32(0), var(T))
         if fp8kv and full:
             step(n + "kv_dequant", "kv_dequant", kv, buf("block_table"), i32(max_pages), buf("seq_lens"), var(S),
                  buf("pick"), buf("kvd"))
-        step(n + "attn", "flash_mla", buf("qmla"), buf("qmla", KVL * 2), buf("kvd") if fp8kv else kv, buf("ind"),
+        step(n + "attn", "flash_mla", buf("qmla"), buf("qb", NOPE * 2), buf("kvd") if fp8kv else kv, buf("ind"),
              buf("tlen"), buf("o"), buf("ml"), buf("lse"), after=[1] if full or fp8kv else [])
         step(n + "uv", "uv", buf("o"), buf(n + "kvb", NOPE * KVL * 2), buf("oq"), buf("osf"), var(T), MC_M)
         gemm(n + "o", "o", "oq", n + "w_o", "res", a_sf="osf")  # res += o_proj's output (a TMA reduce-add)
