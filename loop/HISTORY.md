@@ -54,3 +54,4 @@ SGLang's prompt logprobs (its fp8-KV run), and against the checkpoint before.
 | 31 | a11f967 | shared expert is the grouped GEMMs' group 0, its own GEMMs and silu_shared gone | 213.50 | 978.37 | 243.48 | -0.08% | 459 | top-1 100.000% · flips 0 (confident 0) |
 | 32 | 927c966 | up to 4096 rows the routed rows' tokens and scales written by a launch of their own | 212.85 | 978.03 | 242.85 | -0.26% | 467 | top-1 100.000% · flips 0 (confident 0) |
 | 33 | 8d91f88 | routed GEMMs' weights tile-major, a TMA box one contiguous 8 KB read (with the combine's loads first) | 211.13 | 975.34 | 241.09 | -0.72% | 467 | top-1 100.000% · flips 0 (confident 0) |
+| 34 | 3795e29 | flash_mla loads the next row's Q during a row's last block | 210.76 | 972.46 | 240.62 | -0.20% | 467 | top-1 100.000% · flips 0 (confident 0) |

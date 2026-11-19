@@ -650,13 +650,17 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
             tQ_rope.data().get() = tmem_cols::Q_RoPE;
             tO.data().get() = tmem_cols::O;
             
+            bool q_issued = false;  // this job's Q TMAs went out during the last job's last block
             run_outer_loop([&](const OuterloopArgs &args) {
                 // Copy Q into k["buffer idx of the 1st block"+1]
                 // NOTE. As we reach here, we must have already issued the last O gemm of the last round, which means that the penultimate O gemm must be finished (since the last O gemm |-> bar_so_ready (the last S is ready) |-> the penultimate O gemm must be finished). So the corresponding K buffer must be free.
                 // For the RoPE part, as we reach here, the last S from the last round must be ready, which means that the corresponding K RoPE buffer must be free.
                 int q_slot_idx = rs.offset_by(+1).get<NUM_BUFS>().first;
-                issue_q_rope_tma(args.s_q_idx);
-                issue_q_nope_tma(args.s_q_idx, q_slot_idx);
+                if (!q_issued) {
+                    issue_q_rope_tma(args.s_q_idx);
+                    issue_q_nope_tma(args.s_q_idx, q_slot_idx);
+                }
+                q_issued = false;
                 issue_q_rope_utccp(args.outer_loop_phase);
                 issue_q_nope_utccp(args.outer_loop_phase, q_slot_idx);
                 // NOTE Here we don't need to wait for bar_prologue_utccp_rope, since the copy-in of the first RoPE relies on bar_prologue_utccp_rope
@@ -714,6 +718,22 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                         // O += sS @ sV
                         ku::utcmma_ss(tiled_mma_O, sS, sV, tO, k == 1);
                         ku::umma_arrive_noelect(plan.bar_sv_done[buf_idx]);
+
+                        // The last block: the next job's Q goes out now, into the next row's block-1 buffer (this
+                        // row's block k - 1, free once its S V GEMM is done) and the rope slot (free once this
+                        // block's rope GEMM is). Its UTCCP still waits for the next row's start.
+                        if (k == args.num_k_blocks - 1) {
+                            plan.bar_clc_full.wait(args.outer_loop_phase);
+                            ku::CLCResult next_job = ku::get_clc_query_response<true>(plan.clc_response_obj);
+                            if (next_job.is_valid) {
+                                plan.bar_sv_done[buf_idx].wait(bar_phase);
+                                if constexpr (HAVE_ROPE)
+                                    plan.bar_qk_rope_done.wait(rs.get<1>().second);
+                                issue_q_rope_tma(next_job.x);
+                                issue_q_nope_tma(next_job.x, buf_idx);
+                                q_issued = true;
+                            }
+                        }
                     }
 
                     rs.update();

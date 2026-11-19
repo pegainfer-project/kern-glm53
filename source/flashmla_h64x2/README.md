@@ -29,6 +29,10 @@ warpgroup (512 threads): thread (lane quadrant q, group g) holds head (q & 1) * 
 - The exponentials of S are `ex2.approx.ftz` (`exp2_ftz`), as FlashMLA's own build (`--use_fast_math`) runs
   them; this build has no fast math, and `exp2f` added a subnormal-result fix-up (a compare, two predicated
   multiplies) to every one.
+- The MMA warp issues the next job's Q TMAs in a row's last block, once the S V GEMM of the block before frees
+  the buffer Q lands in (the next row's block-1 buffer) and the last rope GEMM frees the rope slot; the CLC
+  response is read there (its barrier's phase is long complete). The next row starts at Q's UTCCP; upstream
+  started it at the TMA, and each row boundary waited for Q's 72 KB.
 
 The products, S, `li` and the outputs are upstream's, bit for bit; an exponential whose result would be
 subnormal (below 2^-126) is 0 here.
