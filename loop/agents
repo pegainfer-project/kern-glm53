@@ -2,6 +2,7 @@
 # loop/agents: the orchestrator's side of the overnight loop.
 #
 #   loop/agents up NAME HOURS ROUNDFILE   start (or restart) agent NAME
+#     (each agent's local.env leases GPUs 0-2; the orchestrator's keeps GPU 3 for its landings)
 #   loop/agents resume NAME HOURS [WHY]   restart NAME in place: its branch, notes and messages kept, a new deadline
 #   loop/agents tell NAME MESSAGE         append a message to its ROUND.md
 #   loop/agents down [NAME]               stop one agent, or all
@@ -73,7 +74,7 @@ up() {
     git -C "$clone" worktree add -q -b "agent/$name" "$dir" main
     git -C "$dir" submodule update -q --init --recursive
   fi
-  grep -v "^WITHGPU_FIRST=" "$LOOP_DIR/local.env" > "$dir/loop/local.env"
+  { grep -vE "^WITHGPU_(FIRST|GPUS)=" "$LOOP_DIR/local.env"; echo 'WITHGPU_GPUS="0 1 2"'; } > "$dir/loop/local.env"
   local deadline
   deadline=$(date -u -d "+$hours hours" +%FT%T)
   { head -n 1 "$roundfile"

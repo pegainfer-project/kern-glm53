@@ -13,7 +13,7 @@ locks=${WITHGPU_LOCKS:-/dev/shm/withgpu}
 ssh -o BatchMode=yes "$host" "mkdir -p $locks && touch $locks/drain"
 trap 'ssh -o BatchMode=yes "$host" "rm -f $locks/drain"' EXIT
 cmp="python3 $LOOP_DIR/logits_cmp.py $GLM_SGLANG_REF $out-c1.pt${base:+ && python3 $LOOP_DIR/logits_cmp.py $base-c1.pt $out-c1.pt}"
-"$LOOP_DIR/withgpu" -n 4 bash -c "docker run --rm --gpus all --ipc host --network none --entrypoint bash \
+WITHGPU_GPUS="0 1 2 3" "$LOOP_DIR/withgpu" -n 4 bash -c "docker run --rm --gpus all --ipc host --network none --entrypoint bash \
   -u $(id -u):$(id -g) -e HOME=/tmp -e KERN_CACHE_DIR=$KERN_CACHE_DIR -v $KERN_CACHE_DIR:$KERN_CACHE_DIR \
   -v $GLM_SHARED:$GLM_SHARED:ro -v $(dirname "$out"):$(dirname "$out") $GLM_TORCH_IMAGE \
   -c 'pip install -q --no-deps --target /tmp/kp $GLM_KERN_WHEEL >/dev/null 2>&1 && export PYTHONPATH=/tmp/kp && \
