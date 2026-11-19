@@ -2,7 +2,7 @@
 # loop/agents: the orchestrator's side of the overnight loop.
 #
 #   loop/agents up NAME HOURS ROUNDFILE   start (or restart) agent NAME
-#     (each agent's local.env leases GPUs 0-2; the orchestrator's keeps GPU 3 for its landings)
+#     (agents lease GLM_AGENT_HOSTS' GPUs, the orchestrator's landings and checks WITHGPU_HOSTS')
 #   loop/agents resume NAME HOURS [WHY]   restart NAME in place: its branch, notes and messages kept, a new deadline
 #   loop/agents tell NAME MESSAGE         append a message to its ROUND.md
 #   loop/agents down [NAME]               stop one agent, or all
@@ -40,12 +40,18 @@ container_up() {
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-client; } >/dev/null 2>&1'
 }
 
+agent_env() {
+  grep -vE "^WITHGPU_(FIRST|GPUS|HOSTS)=" "$LOOP_DIR/local.env"
+  printf 'WITHGPU_HOSTS="%s"\nWITHGPU_GPUS="%s"\n' "${GLM_AGENT_HOSTS:-$WITHGPU_HOSTS}" "${GLM_AGENT_GPUS:-0 1 2 3}"
+}
+
 resume() {
   local name=$1 hours=$2 dir=$runs/$1 deadline
   container_up
   deadline=$(date -u -d "+$(python3 -c "print(round($hours * 60))") minutes" +%FT%T)
   sed -i -E "s/^\*\*Deadline: [^*]+ UTC\*\*/**Deadline: $deadline UTC**/" "$dir/ROUND.md"
   printf 'budget:\n  hours: %s\n' "$hours" > "$dir/.budget.yaml"
+  agent_env > "$dir/loop/local.env.new" && mv "$dir/loop/local.env.new" "$dir/loop/local.env"
   tell "$name" "${3:-Restarted (outside cause, not yours).} Your branch, work/ and notes are as you left them; check notes/$name.md and git log, then carry on. Main has moved: rebase first."
   window "$name" "docker exec -it -w $dir $container \
     hmz exec -f ralph_loop -c $dir/.budget.yaml -a $spec \"\$(cat $dir/loop/TASK.md $dir/ROUND.md)\"; exec bash"
@@ -74,7 +80,7 @@ up() {
     git -C "$clone" worktree add -q -b "agent/$name" "$dir" main
     git -C "$dir" submodule update -q --init --recursive
   fi
-  { grep -vE "^WITHGPU_(FIRST|GPUS)=" "$LOOP_DIR/local.env"; echo 'WITHGPU_GPUS="0 1 2"'; } > "$dir/loop/local.env"
+  agent_env > "$dir/loop/local.env"
   local deadline
   deadline=$(date -u -d "+$hours hours" +%FT%T)
   { head -n 1 "$roundfile"
@@ -83,6 +89,7 @@ up() {
     printf '\n## Messages from the orchestrator\n\nRe-read this section at the start of every session; new ones are added here.\n'
     tail -n +2 "$roundfile"; } > "$dir/ROUND.md"
   printf 'budget:\n  hours: %s\n' "$hours" > "$dir/.budget.yaml"
+  agent_env > "$dir/loop/local.env.new" && mv "$dir/loop/local.env.new" "$dir/loop/local.env"
   local ex; ex=$(git -C "$dir" rev-parse --git-path info/exclude)
   grep -qx ROUND.md "$ex" 2>/dev/null || printf 'ROUND.md\n.budget.yaml\nloop/local.env\nloop/out/\nwork/\nprofile/\nbuild/\n' >> "$ex"
   docker exec -w "$dir" $container $hmz_py -c 'from hmz.runtime.settings import Settings; Settings().profiles(on=True)'
