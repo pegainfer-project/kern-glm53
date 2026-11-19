@@ -77,3 +77,4 @@ sub-model -0.04% (graph -0.40%).
 | 39 | 974f213 | flash_mla's S V GEMM reads S from TMEM, frees V's first half after its first 256 columns | 208.18 | 963.81 | 237.78 | -0.20% | 415 | top-1 100.000% · flips 0 (confident 0) |
 | 40 | 70976fb | flash_mla's K gathers from three producer warps, none from the MMA warp's sub-partition | 207.51 | 959.27 | 236.96 | -0.34% | 415 | top-1 100.000% · flips 0 (confident 0) |
 | 41 | b50c880 | from 32k keys of context the indexer's logits read a split once for a 16-row q block | 207.20 | 958.29 | 236.62 | -0.14% | 460 | top-1 100.000% · flips 0 (confident 0) |
+| 42 | 8e4cee5 | the indexer's top-k samples a row of 32k to 96k keys for 1.75 x 2048 candidates | 206.88 | 957.77 | 236.35 | -0.11% | 460 | top-1 100.000% · flips 0 (confident 0) |

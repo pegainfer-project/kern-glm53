@@ -7,16 +7,18 @@
 //
 // A row of at most HELD_MAX takes k31_topk_held's route. A longer row's sample (k31_topk's, read in
 // 16-byte loads all at once) puts a threshold T, a bf16 key, where 1.125 x 2048 keys are expected at or
-// above it. One read against T keeps every position at or above it as a candidate (its position and
-// key - T in a word, up to CAND) and counts every one of them in a 4096-bin histogram of key - T, the
-// last bin taking the rest. The histogram gives the cut key K and how many of K's ties the 2048 take;
-// with more candidates than CAND kept, one more read at T = K keeps them. A radix select over the ties'
-// positions takes the first ones; the taken positions set bits of a bitmap of the row, which leave in
-// order in equal shares a thread. A row past 2^20, fewer than 2048 candidates, a cut in the last bin, or more ties than
-// CAP take k31_topk's exact route, so the set never depends on the sample.
+// above it (1.75 x in a row shorter than SHORT, whose sample misleads more often). One read against T
+// keeps every position at or above it as a candidate (its position and key - T in a word, up to CAND)
+// and counts every one of them in a 4096-bin histogram of key - T, the last bin taking the rest. The
+// histogram gives the cut key K and how many of K's ties the 2048 take; with more candidates than CAND
+// kept, one more read at T = K keeps them. A radix select over the ties' positions takes the first ones;
+// the taken positions set bits of a bitmap of the row, which leave in order in equal shares a thread. A
+// row past 2^20, fewer than 2048 candidates, a cut in the last bin, or more ties than CAP take k31_topk's
+// exact route, so the set never depends on the sample.
 #include "k31/k31_topk.cu"
 
 #define CAND (2 * CAP)  // candidates kept, a word each, over Smem's ckey and cpos
+#define SHORT 98304     // a long row shorter than this wants 1.75 x 2048 candidates of its sample
 
 extern "C" __device__ const int glm_topk_smem = sizeof(Smem);
 
@@ -270,7 +272,7 @@ __device__ __forceinline__ void row_topk(unsigned char* dyn, const bf16* row, un
     else held<64>(h, row, n, o);
     return;
   }
-  if (n <= 1u << 20 && stream(s, row, n, sample_key(s, row, n, 16 * TK * 9 / 8), o)) return;
+  if (n <= 1u << 20 && stream(s, row, n, sample_key(s, row, n, n < SHORT ? 16 * TK * 7 / 4 : 16 * TK * 9 / 8), o)) return;
   __syncthreads();
   exact_row(s, row, n, o);
 }
