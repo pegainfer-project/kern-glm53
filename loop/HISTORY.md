@@ -25,6 +25,7 @@ SGLang's prompt logprobs (its fp8-KV run), and against the checkpoint before.
 | row 7 + idx's bf16 head sum (row 10's commit) | 95.276% / 10 / 0.0556 | 98.309% / 1 |
 | row 37 (`089db9d`) | 95.276% / 10 / 0.0556 | 100.000% / 0 (bit-identical) |
 | row 47 (`63f1b16`) | 95.276% / 10 / 0.0556 | 100.000% / 0 (bit-identical to row 37) |
+| row 48 (`9f73622`), the last | 95.276% / 10 / 0.0556 | 100.000% / 0 (bit-identical to row 47) |
 
 ## Measured on the PP4 stages
 
