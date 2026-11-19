@@ -96,6 +96,7 @@ author=$(git log -1 --format='%an' "$sha")
 parent=$(git rev-parse --short HEAD)
 note=${note}${WHY_ELSE:+${note:+; }$WHY_ELSE}
 echo "| $n | $parent | $what | $short | $long | $all | $delta | $launches | $gate${note:+; $note} |" >> "$LOOP_DIR/HISTORY.md"
+python3 "$LOOP_DIR/climb.py" > /dev/null
 git add -A
 git commit -q -C "$sha" --signoff
 cp "$work/l11.json" "$work/l11c.json" "$base/"

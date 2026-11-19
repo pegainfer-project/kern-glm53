@@ -1,10 +1,15 @@
 # The climb
 
+![the climb](climb.svg)
+
+`loop/climb.py` redraws it from the rows below (`loop/land` does, on every landing).
+
 Every optimization merged into `main`, in order, each measured on `main` right after it landed:
 `loop/score`'s mean TTFT of the AgentX corpus on an idle PP4, projected to 78 layers. Row 0 is a bench of
 main; every later row is the row above times `loop/ab`'s ratio of main with it to main before it (two
 ABBA pairs on one GPU to row 38, four from row 39; from row 42 the ratio of `loop/pp`'s stage 0 (the
-serving stage 0 on real inputs, 18 layers), two pairs; `loop/chain.py`), since GPUs differ by more than most changes. `after` is the commit of main it landed on
+serving stage 0 on real inputs, 18 layers), two pairs, four when the first two put it between -0.1% and 0;
+`loop/land`), since GPUs differ by more than most changes. `after` is the commit of main it landed on
 (the row's own commit is the next one on main: `git log --ancestry-path <after>..main | tail -1`). `Δ all`
 is that A/B's. Numerics are `loop/longcheck`'s long pass against the row above.
 
