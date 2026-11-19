@@ -7,6 +7,20 @@ ABBA pairs on one GPU, `loop/chain.py`), since GPUs differ by more than most cha
 (the row's own commit is the next one on main: `git log --ancestry-path <after>..main | tail -1`). `Δ all`
 is that A/B's. Numerics are `loop/longcheck`'s long pass against the row above.
 
+## 78-layer checkpoints
+
+`loop/fullcheck`: the PP4 serving stages teacher-forced over six chat prompts (24300 positions) against
+SGLang's prompt logprobs (its fp8-KV run), and against the checkpoint before.
+
+| main | vs SGLang: top-1 / confident flips / \|dlp\| mean | vs the checkpoint before |
+|---|---|---|
+| row 0 | 95.222% / 10 / 0.0555 | |
+| row 7 (`ff9ecc7`) | 95.198% / 11 / 0.0555 | 98.374% / 1 |
+| row 7 + idx's bf16 head sum (row 10's commit) | 95.276% / 10 / 0.0556 | 98.309% / 1 |
+| row 37 (`089db9d`) | 95.276% / 10 / 0.0556 | 100.000% / 0 (bit-identical) |
+
+## Rows
+
 | # | after | what | short ms | long ms | all ms | Δ all | launches | numerics |
 |---|---|---|---|---|---|---|---|---|
 | 0 | 8374b60 | baseline: deterministic top-k (k31_topk), reproducible builds | 271.59 | 1229.57 | 309.17 | — | 436 | 78 layers vs SGLang fp8 KV: top-1 95.22%, 10 confident |
@@ -34,17 +48,6 @@ is that A/B's. Numerics are `loop/longcheck`'s long pass against the row above.
 | 22 | dfd2f45 | MoE combine takes the next layer's input norm when that layer shares the picks | 218.04 | 1004.71 | 248.88 | -0.15% | 579 | top-1 100.000% · flips 0 (confident 0) |
 | 23 | 1a76317 | past 1024 rows the shared expert's GEMMs take the multicast tile | 217.53 | 1004.22 | 248.37 | -0.20% | 587 | top-1 100.000% · flips 0 (confident 0) |
 | 24 | 4f3c271 | o_proj adds into the residual stream, norm_post reads res alone | 217.51 | 1003.12 | 248.31 | -0.03% | 587 | top-1 100.000% · flips 0 (confident 0) |
-
-## 78-layer checkpoints
-
-`loop/fullcheck`: the PP4 serving stages teacher-forced over six chat prompts (24300 positions) against
-SGLang's prompt logprobs (its fp8-KV run), and against the checkpoint before.
-
-| main | vs SGLang: top-1 / confident flips / \|dlp\| mean | vs the checkpoint before |
-|---|---|---|
-| row 0 | 95.222% / 10 / 0.0555 | |
-| row 7 (`ff9ecc7`) | 95.198% / 11 / 0.0555 | 98.374% / 1 |
-| row 7 + idx's bf16 head sum (row 10's commit) | 95.276% / 10 / 0.0556 | 98.309% / 1 |
 | 25 | 46ed875 | past 256 rows the v up-projection on a 2-CTA cluster sharing W_UV | 217.11 | 1001.01 | 247.85 | -0.19% | 598 | top-1 100.000% · flips 0 (confident 0) |
 | 26 | 572de46 | flash_mla's row-maximum barrier joins the four warps of a 32-head half | 216.75 | 999.46 | 247.44 | -0.16% | 598 | top-1 100.000% · flips 0 (confident 0) |
 | 27 | 299650f | indexer top-k writes its picks as stream rows itself, glm_topk_stream gone | 216.49 | 999.85 | 247.20 | -0.10% | 598 | top-1 100.000% · flips 0 (confident 0) |
