@@ -8,7 +8,8 @@
 # TASK.md's floor): appends the HISTORY.md row (main's commit it lands after, the row above times the A/B's B/A ratio per scenario,
 # Δ all the A/B's own, launches, the gate's long line, NOTE) and commits the pick with SHA's message and author; main's base moves to it
 # (manifests, bench report, recordings). Without LAND=1 the pick is left staged for a look; `git reset --hard`
-# drops it.
+# drops it. WHY_ELSE="..." waives the all-lower bar (only that) for a change whose win the stages benched
+# here cannot see (deep layers on synthetic inputs, kern #151); its reason goes into the row's note.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 sha=$1 what=$2 note=${3:-}
@@ -57,8 +58,8 @@ PATH=$(dirname "$GLM_NVCC"):$PATH KERN_INDEX_DIR=$GLM_KERN/kernel_index "$REPO/s
 [[ ${LAND:-0} == 1 ]] || { echo "land: staged, not committed (LAND=1 to commit)"; exit 0; }
 launches() { grep -oE '[0-9]+ launches' "$1" | head -1 | cut -d' ' -f1; }
 "$LOOP_DIR/count" "$base/l11.json" > "$work/count-base.txt" 2>/dev/null || true
-python3 - "$work/pp.txt" "$work/lc.txt" "$(launches "$work/count.txt")" "$(launches "$work/count-base.txt")" <<'PY' || { echo "land: held, staged for a look"; exit 1; }
-import re, sys
+WHY_ELSE=${WHY_ELSE:-} python3 - "$work/pp.txt" "$work/lc.txt" "$(launches "$work/count.txt")" "$(launches "$work/count-base.txt")" <<'PY' || { echo "land: held, staged for a look"; exit 1; }
+import os, re, sys
 ab, lc = open(sys.argv[1]).read(), open(sys.argv[2]).read()
 d = {k: float(v) for k, v in re.findall(r"(short|long|all) [\d.]+ -> [\d.]+ ms \(([-+][\d.]+)%\)", ab.split("\npp ")[-1])}
 floor = {"long": (90.8, 4, 0.075), "short": (94.3, 2, 0.045)}
@@ -66,7 +67,7 @@ def within(name):
     m = re.search(rf"^{name} +positions \d+ · top-1 ([\d.]+)% · flips \d+ \(confident (\d+)\) · \|dlp\| mean ([\d.]+)", lc, re.M)
     top1, conf, dlp = floor[name]
     return bool(m) and float(m[1]) >= top1 and int(m[2]) <= conf and float(m[3]) <= dlp
-fewer = len(sys.argv) > 3 and int(sys.argv[3]) < int(sys.argv[4]) and d.get("all", 0) <= 0
+fewer = (len(sys.argv) > 3 and int(sys.argv[3]) < int(sys.argv[4]) and d.get("all", 0) <= 0) or (bool(os.environ["WHY_ELSE"]) and d.get("all", 0) <= 0)
 why = [w for w, bad in [("all not lower by 0.1% (and not fewer launches at no cost)", d.get("all", 0) > -0.1 and not fewer), ("short up", d.get("short", 0) > 0.3),
                         ("long up", d.get("long", 0) > 0.3), ("long outside the floor", not within("long")),
                         ("short outside the floor", not within("short"))] if bad]
@@ -87,6 +88,7 @@ launches=$(grep -oE '[0-9]+ launches' "$work/count.txt" | cut -d' ' -f1)
 gate=$(grep -E '^long ' "$work/lc.txt" | sed -E 's/^long +positions [0-9]+ · //; s/ · \|dlp\|.*//')
 author=$(git log -1 --format='%an' "$sha")
 parent=$(git rev-parse --short HEAD)
+note=${note}${WHY_ELSE:+${note:+; }$WHY_ELSE}
 echo "| $n | $parent | $what | $short | $long | $all | $delta | $launches | $gate${note:+; $note} |" >> "$LOOP_DIR/HISTORY.md"
 git add -A
 git commit -q -C "$sha" --signoff
