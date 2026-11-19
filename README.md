@@ -15,6 +15,16 @@ indexer (`full`) layer, so a shared layer's top-k never crosses a cut and only t
 (`h`, `res`) moves between stages. Each stage is a single-GPU manifest over the GLM-5.3 FP8
 checkpoint (GLM-5.2-FP8 has the same tensors).
 
+## The climb
+
+![the climb](loop/climb.svg)
+
+Mean TTFT over the AgentX corpus on an idle PP4, every optimization a commit on `main`: short prefills on a
+long context, long prefills and all, -24.5% / -22.7% / -24.2% from row 0, each landing through the numerics gate
+(78 layers against SGLang's fp8-KV run: top-1 95.22% at row 0, 95.28% at row 47). The rows, how each was
+measured and the checkpoints are in [loop/HISTORY.md](loop/HISTORY.md); the loop that made them (agents,
+gates, tools) is [loop/TASK.md](loop/TASK.md).
+
 ## Choices
 
 - **FP8 scales.** The checkpoint's f32 128x128 block scales are re-quantized at load to UE8M0 (power
