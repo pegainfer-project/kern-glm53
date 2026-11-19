@@ -136,7 +136,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
                                ["in buffer<bf16>", "i32", "out buffer<u8>", "out buffer<u8>", "i32", "in buffer<i32>",
                                 "i32"], {5}, [{"mul": [T, DENSE_I // 1024]}, 1, 1], [256, 1, 1]),
         "q_post_full": G.plain("glm_glue", "glm_q_post",
-                               ["in buffer<bf16>", "i32", "in buffer<bf16>", "in buffer<i32>", "inout buffer<bf16>",
+                               ["in buffer<bf16>", "i32", "in buffer<bf16>", "in buffer<i32>", "out buffer<bf16>",
                                 "out buffer<u8>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32"], [T, 1, 1], [256, 1, 1]),
         "q_post_shared": G.nulled("glm_glue", "glm_q_post",
                                   ["in buffer<bf16>", "i32", "in buffer<bf16>", "in buffer<i32>", "inout buffer<bf16>",
@@ -413,10 +413,10 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
             step(n + "kv_dequant", "kv_dequant", kv, buf("block_table"), i32(max_pages), buf("seq_lens"), var(S),
                  buf("pick"), buf("kvd"), lane=1, after=[0])
         gemm(n + "b", "b.full" if full else "b.shared", "qq", n + "w_b", "qb", a_sf="qsf")
-        step(n + "uk", "uk", buf("qb"), buf(n + "wuk"), buf("qmla"), var(T))
-        if full:
+        if full:  # q's absorb (qmla's latent half; q_post writes its rope half) beside the indexer
             step(n + "q_post", "q_post_full", buf("qb"), i32(NB[True]), buf("rope"), buf("pos"), buf("qmla"), buf("iq"),
                  buf("iw"), buf("wout"), i32(1), var(T))
+            step(n + "uk", "uk", buf("qb"), buf(n + "wuk"), buf("qmla"), var(T), lane=1, after=[0])
             step(n + "idx_gather", "idx_gather", st(f"idx.{l}"), buf("block_table"), i32(max_pages), buf("seq_lens"),
                  var(S), buf("kg"), buf("ksf"), buf("pick"))
             for j in range(chunk // sub):
@@ -431,13 +431,14 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
                 step(n + "topk_slots", "topk_slots", buf("ind"), buf("block_table"), i32(max_pages), buf("row_seq"),
                      buf("klen"), buf("tlen"), var(T))
         else:
+            step(n + "uk", "uk", buf("qb"), buf(n + "wuk"), buf("qmla"), var(T))
             step(n + "q_post", "q_post_shared", buf("qb"), i32(NB[True]), buf("rope"), buf("pos"), buf("qmla"),
                  i32(0), var(T))
         if fp8kv and full:
             step(n + "kv_dequant", "kv_dequant", kv, buf("block_table"), i32(max_pages), buf("seq_lens"), var(S),
                  buf("pick"), buf("kvd"))
         step(n + "attn", "flash_mla", buf("qmla"), buf("qmla", KVL * 2), buf("kvd") if fp8kv else kv, buf("ind"),
-             buf("tlen"), buf("o"), buf("ml"), buf("lse"), after=[1] if fp8kv and not full else [])
+             buf("tlen"), buf("o"), buf("ml"), buf("lse"), after=[1] if full or fp8kv else [])
         step(n + "uv", "uv", buf("o"), buf(n + "kvb", NOPE * KVL * 2), buf("oq"), buf("osf"), var(T), MC_M)
         gemm(n + "o", "o", "oq", n + "w_o", "res", a_sf="osf")  # res += o_proj's output (a TMA reduce-add)
         if l < DENSE:
