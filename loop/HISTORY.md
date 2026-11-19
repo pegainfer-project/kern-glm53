@@ -3,7 +3,7 @@
 Every optimization merged into `main`, in order, each measured on `main` right after it landed:
 `loop/score`'s mean TTFT of the AgentX corpus on an idle PP4, projected to 78 layers. Row 0 is a bench of
 main; every later row is the row above times `loop/ab`'s ratio of main with it to main before it (two
-ABBA pairs on one GPU, `loop/chain.py`), since GPUs differ by more than most changes. `after` is the commit of main it landed on
+ABBA pairs on one GPU to row 38, four from row 39, `loop/chain.py`), since GPUs differ by more than most changes. `after` is the commit of main it landed on
 (the row's own commit is the next one on main: `git log --ancestry-path <after>..main | tail -1`). `Δ all`
 is that A/B's. Numerics are `loop/longcheck`'s long pass against the row above.
 

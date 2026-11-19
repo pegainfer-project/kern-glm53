@@ -2,7 +2,7 @@
 # loop/land SHA "WHAT" [NOTE]: the orchestrator's merge of one agent commit into this checkout's main.
 #
 # Cherry-picks SHA without committing (a conflict only in kernels.toml takes SHA's side hunk by hunk), builds and repins, generates the sub-model, A/Bs main's base
-# against it (loop/ab, two pairs) and runs the numerics gate against main (loop/longcheck). Prints both. Then,
+# against it (loop/ab, four pairs) and runs the numerics gate against main (loop/longcheck). Prints both. Then,
 # only with LAND=1 and the gate passing (all lower by 0.1%, or fewer launches and all not up, short and long not up beyond 0.3%, longcheck inside
 # TASK.md's floor): appends the HISTORY.md row (main's commit it lands after, the row above times the A/B's B/A ratio per scenario,
 # Δ all the A/B's own, launches, the gate's long line, NOTE) and commits the pick with SHA's message and author; main's base moves to it
@@ -46,7 +46,7 @@ work=$GLM_LOOP_DATA/land/$sha
 mkdir -p "$work"
 "$LOOP_DIR/build" --update > "$work/build.log" 2>&1 || { tail -3 "$work/build.log"; exit 1; }
 "$LOOP_DIR/gen" "$work" | tee "$work/count.txt"
-"$LOOP_DIR/ab" "$base/l11.json" "$work/l11.json" "$work/ab" 2 | tee "$work/ab.txt"
+"$LOOP_DIR/ab" "$base/l11.json" "$work/l11.json" "$work/ab" 4 | tee "$work/ab.txt"
 "$LOOP_DIR/longcheck" "$work/l11.json" "$work/lc" | tee "$work/lc.txt"
 [[ ${LAND:-0} == 1 ]] || { echo "land: staged, not committed (LAND=1 to commit)"; exit 0; }
 launches() { grep -oE '[0-9]+ launches' "$1" | head -1 | cut -d' ' -f1; }
