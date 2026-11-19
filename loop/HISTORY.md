@@ -3,7 +3,8 @@
 Every optimization merged into `main`, in order, each measured on `main` right after it landed:
 `loop/score`'s mean TTFT of the AgentX corpus on an idle PP4, projected to 78 layers. Row 0 is a bench of
 main; every later row is the row above times `loop/ab`'s ratio of main with it to main before it (two
-ABBA pairs on one GPU to row 38, four from row 39, `loop/chain.py`), since GPUs differ by more than most changes. `after` is the commit of main it landed on
+ABBA pairs on one GPU to row 38, four from row 39; from row 42 the ratio of `loop/pp`, the 78-layer PP4
+serving stages themselves on four GPUs, two pairs; `loop/chain.py`), since GPUs differ by more than most changes. `after` is the commit of main it landed on
 (the row's own commit is the next one on main: `git log --ancestry-path <after>..main | tail -1`). `Δ all`
 is that A/B's. Numerics are `loop/longcheck`'s long pass against the row above.
 
@@ -18,6 +19,15 @@ SGLang's prompt logprobs (its fp8-KV run), and against the checkpoint before.
 | row 7 (`ff9ecc7`) | 95.198% / 11 / 0.0555 | 98.374% / 1 |
 | row 7 + idx's bf16 head sum (row 10's commit) | 95.276% / 10 / 0.0556 | 98.309% / 1 |
 | row 37 (`089db9d`) | 95.276% / 10 / 0.0556 | 100.000% / 0 (bit-identical) |
+
+## Measured on the 78-layer PP4 stages
+
+`loop/pp` (2026-11-19): the four serving stages benched at once, a shape's stage times summed, the grid weighted
+as `loop/score` weighs it. Row 0 (`619e0d1`) against row 41 (`f0bb52b`), two pairs on one host: short 212.17 ->
+163.73 ms (-22.83%), long 1211.50 -> 958.09 ms (-20.92%), all 251.37 -> 194.89 ms (-22.47%); the chained
+sub-model rows say -23.7% / -22.1% / -23.5%. A null run of main against itself: all -0.01%, a shape within 0.2%.
+The sub-model can still read a data-dependent kernel wrong: idx's top-k sample floor (`c6666a6`) scored -0.04%
+(graph -0.40%) there and is +0.71% on the stages, slower the longer the context.
 
 ## Rows
 

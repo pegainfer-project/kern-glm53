@@ -2,8 +2,9 @@
 # loop/land SHA "WHAT" [NOTE]: the orchestrator's merge of one agent commit into this checkout's main.
 #
 # Cherry-picks SHA without committing (a conflict only in kernels.toml takes SHA's side hunk by hunk), builds and repins, generates the sub-model, A/Bs main's base
-# against it (loop/ab, four pairs) and runs the numerics gate against main (loop/longcheck). Prints both. Then,
-# only with LAND=1 and the gate passing (all lower by 0.1%, or fewer launches and all not up; loop/graph's all not up; short and long not up beyond 0.3%, longcheck inside
+# against it (loop/ab, four pairs, and loop/graph: the sub-model's view, printed only), runs the numerics gate against
+# main (loop/longcheck) and times main's PP4 serving stages against the pick's (loop/pp, two pairs). Then,
+# only with LAND=1 and the gate passing (loop/pp's all lower by 0.1%, or fewer launches and all not up; short and long not up beyond 0.3%, longcheck inside
 # TASK.md's floor): appends the HISTORY.md row (main's commit it lands after, the row above times the A/B's B/A ratio per scenario,
 # Δ all the A/B's own, launches, the gate's long line, NOTE) and commits the pick with SHA's message and author; main's base moves to it
 # (manifests, bench report, recordings). Without LAND=1 the pick is left staged for a look; `git reset --hard`
@@ -49,15 +50,17 @@ mkdir -p "$work"
 "$LOOP_DIR/ab" "$base/l11.json" "$work/l11.json" "$work/ab" 4 | tee "$work/ab.txt"
 "$LOOP_DIR/graph" "$work/ab" | tee -a "$work/ab.txt"
 "$LOOP_DIR/longcheck" "$work/l11.json" "$work/lc" | tee "$work/lc.txt"
+# the gate's timing: the 78-layer PP4 serving stages themselves (loop/pp), main's against the pick's
+PATH=$(dirname "$GLM_NVCC"):$PATH KERN_INDEX_DIR=$GLM_KERN/kernel_index "$REPO/scripts/deploy.sh" "$GLM_KERN" "$work/stages" \
+  > "$work/deploy.log" 2>&1 || { tail -3 "$work/deploy.log"; exit 1; }
+"$LOOP_DIR/pp" "$base/p" "$work/stages/p" "$work/pp" 2 | tee "$work/pp.txt"
 [[ ${LAND:-0} == 1 ]] || { echo "land: staged, not committed (LAND=1 to commit)"; exit 0; }
 launches() { grep -oE '[0-9]+ launches' "$1" | head -1 | cut -d' ' -f1; }
 "$LOOP_DIR/count" "$base/l11.json" > "$work/count-base.txt" 2>/dev/null || true
-python3 - "$work/ab.txt" "$work/lc.txt" "$(launches "$work/count.txt")" "$(launches "$work/count-base.txt")" <<'PY' || { echo "land: held, staged for a look"; exit 1; }
+python3 - "$work/pp.txt" "$work/lc.txt" "$(launches "$work/count.txt")" "$(launches "$work/count-base.txt")" <<'PY' || { echo "land: held, staged for a look"; exit 1; }
 import re, sys
 ab, lc = open(sys.argv[1]).read(), open(sys.argv[2]).read()
-score, graph = ab.split("\ngraph ")[0], ab.split("\ngraph ")[-1]
-d = {k: float(v) for k, v in re.findall(r"(short|long|all) [\d.]+ -> [\d.]+ ms \(([-+][\d.]+)%\)", score.split("median ")[-1])}
-g = {k: float(v) for k, v in re.findall(r"(short|long|all) [\d.]+ -> [\d.]+ ms \(([-+][\d.]+)%\)", graph)}
+d = {k: float(v) for k, v in re.findall(r"(short|long|all) [\d.]+ -> [\d.]+ ms \(([-+][\d.]+)%\)", ab.split("\npp ")[-1])}
 floor = {"long": (90.8, 4, 0.075), "short": (94.3, 2, 0.045)}
 def within(name):
     m = re.search(rf"^{name} +positions \d+ · top-1 ([\d.]+)% · flips \d+ \(confident (\d+)\) · \|dlp\| mean ([\d.]+)", lc, re.M)
@@ -65,7 +68,7 @@ def within(name):
     return bool(m) and float(m[1]) >= top1 and int(m[2]) <= conf and float(m[3]) <= dlp
 fewer = len(sys.argv) > 3 and int(sys.argv[3]) < int(sys.argv[4]) and d.get("all", 0) <= 0
 why = [w for w, bad in [("all not lower by 0.1% (and not fewer launches at no cost)", d.get("all", 0) > -0.1 and not fewer), ("short up", d.get("short", 0) > 0.3),
-                        ("long up", d.get("long", 0) > 0.3), ("graph all up", g.get("all", 0) > 0), ("long outside the floor", not within("long")),
+                        ("long up", d.get("long", 0) > 0.3), ("long outside the floor", not within("long")),
                         ("short outside the floor", not within("short"))] if bad]
 print("gate: " + ("pass" if not why else "; ".join(why)))
 sys.exit(1 if why else 0)
@@ -73,7 +76,13 @@ PY
 
 prev=$(grep -E '^\| [0-9]+ \|' "$LOOP_DIR/HISTORY.md" | tail -n 1)
 n=$(($(cut -d'|' -f2 <<<"$prev") + 1))
-read -r short long all delta < <(python3 "$LOOP_DIR/chain.py" "$work/ab" "$LOOP_DIR" "$prev")
+read -r short long all delta < <(python3 - "$work/pp.txt" "$prev" <<'PY'
+import re, sys
+r = {k: float(b) / float(a) for k, a, b in re.findall(r"(short|long|all) ([\d.]+) -> ([\d.]+) ms", open(sys.argv[1]).read().split("\npp ")[-1])}
+before = dict(zip(("short", "long", "all"), map(float, [c.strip() for c in sys.argv[2].split("|")][4:7])))
+print(*(f"{before[k] * r[k]:.2f}" for k in ("short", "long", "all")), f"{100 * (r['all'] - 1):+.2f}%")
+PY
+)
 launches=$(grep -oE '[0-9]+ launches' "$work/count.txt" | cut -d' ' -f1)
 gate=$(grep -E '^long ' "$work/lc.txt" | sed -E 's/^long +positions [0-9]+ · //; s/ · \|dlp\|.*//')
 author=$(git log -1 --format='%an' "$sha")
@@ -82,6 +91,7 @@ echo "| $n | $parent | $what | $short | $long | $all | $delta | $launches | $gat
 git add -A
 git commit -q -C "$sha" --signoff
 cp "$work/l11.json" "$work/l11c.json" "$base/"
+rm -rf "$base/p" && cp -r "$work/stages/p" "$base/p"
 cp "$work/ab/b-1.json" "$base/bench-$n.json"
 # the gate's candidate recordings are the new main's: they become the base's, newer than its manifest
 for pass in long-c16 short-c3; do cp "$work/lc.$pass.pt" "$base/l11.json.$pass.pt"; done

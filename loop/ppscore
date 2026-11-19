@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""loop/ppscore OUT N: loop/pp's reports scored. A shape's time is its four stages' graph p50s summed; the grid is
+weighted over the corpus as loop/score weights its own (loop/weights.json). Prints each shape's A/B change and the
+per-pair medians of short / long / all."""
+import json
+import pathlib
+import statistics
+import sys
+
+W = json.loads((pathlib.Path(__file__).resolve().parent / "weights.json").read_text())
+out, n = pathlib.Path(sys.argv[1]), int(sys.argv[2])
+
+
+def grid(x, i):
+    g = {}
+    for s in range(4):
+        for sc in json.loads((out / f"{x}-{i}.s{s}.json").read_text())["scenarios"]:
+            k = f"r{sc['scenario']['rows']}-kv{sc['scenario']['context'][0]}"
+            g[k] = g.get(k, 0.0) + sc["graph"]["stats"]["p50"] / 1e3
+    return g
+
+
+def score(g):
+    r = {name: sum(w * g[k] for k, w in ws.items()) / W["requests"][name] for name, ws in W["weights"].items()}
+    r["all"] = sum(r[name] * W["requests"][name] for name in W["weights"]) / sum(W["requests"].values())
+    return r
+
+
+ga = [grid("a", i) for i in range(1, n + 1)]
+gb = [grid("b", i) for i in range(1, n + 1)]
+for k in ga[0]:
+    a, b = statistics.median(g[k] for g in ga), statistics.median(g[k] for g in gb)
+    print(f"{k:16s} A {a:9.2f}  B {b:9.2f}  {(b / a - 1) * 100:+.2f}%")
+sa, sb = [score(g) for g in ga], [score(g) for g in gb]
+med = lambda s, k: statistics.median(x[k] for x in s)
+print("pp     " + "  ".join(f"{k} {med(sa, k):.2f} -> {med(sb, k):.2f} ms ({(med(sb, k) / med(sa, k) - 1) * 100:+.2f}%)"
+                           for k in sa[0]))
