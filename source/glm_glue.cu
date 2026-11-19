@@ -204,16 +204,58 @@ __device__ __forceinline__ void rms_quant_row(int r, Add add, bf16* __restrict__
   }
 }
 
-// rms_quant_row with the addend a (may be null).   grid (T), block 256
+// rms_quant_row with a bf16 addend a (may be null), the row held as packed bf16 between its passes (48 registers,
+// not 52: five rows an SM, not four; combine_quant keeps rms_quant_row, slower this way).
+__device__ __forceinline__ void norm_row(int r, const bf16* __restrict__ a, bf16* __restrict__ res,
+                                         const bf16* __restrict__ gamma, bf16* __restrict__ normed, u8* __restrict__ q,
+                                         u8* __restrict__ sf, int sf_rows) {
+  __shared__ float sm[8];
+  __shared__ __align__(16) bf16 xs[H];
+  const int t = threadIdx.x, w = t >> 5, l = t & 31;
+  bf16* row = res + (size_t)r * H;
+  uint4 v[3];
+  float ss = 0.f;
+#pragma unroll
+  for (int i = 0; i < 3; ++i) v[i] = *reinterpret_cast<const uint4*>(row + (t + 256 * i) * 8);
+#pragma unroll
+  for (int i = 0; a && i < 3; ++i) {
+    float x[8], y[8];
+    ld8(a + (size_t)r * H + (t + 256 * i) * 8, x);
+    ld8(reinterpret_cast<const bf16*>(&v[i]), y);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) y[j] += x[j];
+    st8(reinterpret_cast<bf16*>(&v[i]), y);
+    *reinterpret_cast<uint4*>(row + (t + 256 * i) * 8) = v[i];
+  }
+#pragma unroll
+  for (int i = 0; i < 3; ++i) *reinterpret_cast<uint4*>(xs + (t + 256 * i) * 8) = v[i];
+  __syncthreads();
+#pragma unroll
+  for (int i = 0; i < 6; ++i) {
+    float u[4];
+    ld4(xs + (w * 6 + i) * 128 + l * 4, u);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) ss += u[j] * u[j];
+  }
+  const float rr = rsqrtf(block_sum(ss, sm) / H + EPS);
+#pragma unroll
+  for (int i = 0; i < 3; ++i) {
+    const int c = (t + 256 * i) * 8;
+    float g[8], x[8], y[8];
+    ld8(gamma + c, g);
+    ld8(reinterpret_cast<const bf16*>(&v[i]), x);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) y[j] = rnd(rnd(x[j] * rr) * g[j]);
+    if (normed) st8(normed + (size_t)r * H + c, y);
+    if (q) quant8(y, q + (size_t)r * H + c, sf, sf_rows, r, c >> 7);
+  }
+}
+
+// norm_row over row blockIdx.x.   grid (T), block 256
 extern "C" __global__ void __launch_bounds__(256) glm_add_rms_quant(
     const bf16* __restrict__ a, bf16* __restrict__ res, const bf16* __restrict__ gamma, bf16* __restrict__ normed,
     u8* __restrict__ q, u8* __restrict__ sf, int sf_rows, int T) {
-  const int r = blockIdx.x;
-  rms_quant_row(r, [&](int c, float x[8]) {
-    if (!a) return false;
-    ld8(a + (size_t)r * H + c, x);
-    return true;
-  }, res, gamma, normed, q, sf, sf_rows);
+  norm_row(blockIdx.x, a, res, gamma, normed, q, sf, sf_rows);
 }
 
 // act = bf16(silu(g) * u) over gate | up halves of gu [rows, 2I], quantized per 128 columns into
