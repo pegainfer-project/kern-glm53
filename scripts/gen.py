@@ -522,7 +522,7 @@ def main():
     ap.add_argument("--chunk", type=int, default=16384, help="rows a call packs at most")
     ap.add_argument("--pack", type=int, default=16, help="sequences a call packs back to back")
     ap.add_argument("--max-ctx", type=int, default=1 << 20, help="the call's sequences' lengths summed, at most")
-    ap.add_argument("--sub", type=int, default=1024, help="rows a call's indexer scores at once (logits sub x max-ctx bf16)")
+    ap.add_argument("--sub", type=int, default=2048, help="rows a call's indexer scores at once (logits sub x max-ctx bf16)")
     ap.add_argument("--cuts", default="18,38,58", help="layers a stage starts at, each an indexer layer")
     ap.add_argument("--kv", choices=("fp8", "bf16"), default="fp8", help="the latent cache's rows")
     ap.add_argument("--first", type=int, default=0,

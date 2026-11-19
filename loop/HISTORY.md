@@ -56,3 +56,4 @@ SGLang's prompt logprobs (its fp8-KV run), and against the checkpoint before.
 | 33 | 8d91f88 | routed GEMMs' weights tile-major, a TMA box one contiguous 8 KB read (with the combine's loads first) | 211.13 | 975.34 | 241.09 | -0.72% | 467 | top-1 100.000% · flips 0 (confident 0) |
 | 34 | 3795e29 | flash_mla loads the next row's Q during a row's last block | 210.76 | 972.46 | 240.62 | -0.20% | 467 | top-1 100.000% · flips 0 (confident 0) |
 | 35 | 4388135 | indexer layer's q absorb on lane 1 beside the indexer, flash_mla joins it | 210.30 | 975.32 | 240.28 | -0.14% | 467 | top-1 100.000% · flips 0 (confident 0) |
+| 36 | e8bee89 | an indexer call scores 2048 rows at once, half the indexer launches | 210.80 | 974.87 | 240.74 | +0.19% | 382 | top-1 100.000% · flips 0 (confident 0) |
