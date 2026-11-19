@@ -47,11 +47,11 @@ includes = ["deepgemm"]
 
 # FlashMLA's sm100 head64 sparse prefill with two softmax warpgroups (source/flashmla_h64x2/, MIT).
 [kernels."glm_flashmla2"]
-sha256 = "cbdc0909ab58b9191475c08d4b40dfadce61511fd2f4958703fc4a6e7b134ec5"
+sha256 = "328d344c851c3d60b270c81f33cf319ecb69cf745e33c78a78b222fcc9d595a2"
 source = "source/glm_flashmla2.cu"
 flags = "flashmla"
 includes = ["flashmla"]
-defines = { GLM_SMEM = 231728 }
+defines = { GLM_SMEM = 231744 }
 
 # The indexer's top-k over kern-k31's (source/k31/README.md): vLLM's top-2048 set in ascending positions,
 # deterministic; a long row read once against its sample's threshold (source/glm_topk.cu).

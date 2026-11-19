@@ -60,6 +60,7 @@ struct tmem_cols {
     static constexpr int Q_RoPE = 256 + 128;
     static constexpr int P = 400;
     static constexpr int LI = 464;   // two float2 a lane: group 0's partial li, alternate blocks
+    static constexpr int S = 480;    // S, copied from smem into both lane halves for the S V GEMM
 };
 
 using SmemLayoutQNoPE = decltype(coalesce(tile_to_shape(
@@ -95,6 +96,13 @@ using SmemLayoutV = decltype(coalesce(
     composition(
         SmemLayoutKNoPE{},
         Layout<Shape<Int<D_V>, Int<B_TOPK>>, Stride<Int<B_TOPK>, _1>>{}
+    )
+, Shape<_1, _1>{}));
+
+using SmemLayoutVHalf = decltype(coalesce(
+    composition(
+        SmemLayoutKTiles<4>{},
+        Layout<Shape<Int<D_V/2>, Int<B_TOPK>>, Stride<Int<B_TOPK>, _1>>{}
     )
 , Shape<_1, _1>{}));
 
@@ -134,6 +142,7 @@ struct SharedMemoryPlan {
     transac_bar_t bar_prologue_q_nope, bar_prologue_q_rope, bar_prologue_utccp_nope, bar_prologue_utccp_rope;
     transac_bar_t bar_qk_nope_done[NUM_BUFS], bar_qk_rope_done;    // Pi = QKi^T (the nope part) done
     transac_bar_t bar_sv_done[NUM_BUFS];    // O += SiVi done (i.e. O, Si and Vi are free)
+    transac_bar_t bar_sv_lo_done[NUM_BUFS]; // its first 256 columns done: Vi's first half (K's dims 0-255) free
     transac_bar_t bar_kv_nope_ready[NUM_BUFS][2], bar_kv_rope_ready;
     transac_bar_t bar_p_free;
     transac_bar_t bar_so_ready;   // S and O are ready
@@ -155,7 +164,7 @@ using TiledMMA_P = decltype(make_tiled_mma(
 ));
 
 using TiledMMA_O = decltype(make_tiled_mma(
-    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H, 256, UMMA::Major::K, UMMA::Major::MN>{}
+    SM100_MMA_F16BF16_WS_TS_NOELECT<bf16, bf16, float, B_H, 256, UMMA::Major::K, UMMA::Major::MN>{}
 ));
 
 enum NamedBarriers : int {

@@ -138,6 +138,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
         for (int i = 0; i < NUM_BUFS; ++i) {
             plan.bar_qk_nope_done[i].init(1);
             plan.bar_sv_done[i].init(1);
+            plan.bar_sv_lo_done[i].init(1);
             plan.bar_kv_nope_ready[i][0].init(1);
             plan.bar_kv_nope_ready[i][1].init(1);
             plan.bar_k_valid_ready[i].init(B_TOPK/8);
@@ -586,7 +587,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                     
                     // Copy NoPE
                     auto [buf_idx, bar_phase] = rs.get<NUM_BUFS>();
-                    plan.bar_sv_done[buf_idx].wait(bar_phase^1);
+                    plan.bar_sv_lo_done[buf_idx].wait(bar_phase^1);
                     bf16* sK_nope_base = plan.u.qko_slots[buf_idx].data() + warp_idx*4*64;
     
                     auto load_kv_nope_part = [&](int part_idx) {
@@ -608,6 +609,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
     
                     if (!should_skip_tma) {
                         load_kv_nope_part(0);
+                        plan.bar_sv_done[buf_idx].wait(bar_phase^1);
                         load_kv_nope_part(1);
                     } else {
                         // NOTE See head128/phase1.cuh for this TMA skipping technique
@@ -643,12 +645,21 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
             Tensor tQ_rope = tiled_mma_P.get_slice(_0{}).make_fragment_A(
                 partition_shape_A(tiled_mma_P, Shape<Int<B_H>, Int<HAVE_ROPE ? QK_MRGEMM_K_ROPE : 64 / (128/B_H)>>{})
             );
-            Tensor tO = partition_fragment_C(tiled_mma_O, Shape<Int<B_H>, Int<D_V>>{});
+            Tensor tO_lo = partition_fragment_C(tiled_mma_O, Shape<Int<B_H>, Int<D_V/2>>{});
+            Tensor tO_hi = partition_fragment_C(tiled_mma_O, Shape<Int<B_H>, Int<D_V/2>>{});
+            Tensor tS = tiled_mma_O.get_slice(_0{}).make_fragment_A(
+                partition_shape_A(tiled_mma_O, Shape<Int<B_H>, Int<B_TOPK>>{})
+            );
+            tS.data().get() = tmem_cols::S;
+            const UMMA::SmemDescriptor sS_desc = UMMA::make_umma_desc<UMMA::Major::K>(
+                make_tensor(make_smem_ptr(plan.s), SmemLayoutS{})
+            );
             tP.data().get() = tmem_cols::P;
             tQ_nope_part0.data().get() = tmem_cols::Q;
             tQ_nope_part1.data().get() = tmem_cols::Q + 64;
             tQ_rope.data().get() = tmem_cols::Q_RoPE;
-            tO.data().get() = tmem_cols::O;
+            tO_lo.data().get() = tmem_cols::O;
+            tO_hi.data().get() = tmem_cols::O + D_V/(128/B_H)/2;
             
             bool q_issued = false;  // this job's Q TMAs went out during the last job's last block
             run_outer_loop([&](const OuterloopArgs &args) {
@@ -707,16 +718,22 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                         // O += S(i-1)V(i-1)
                         auto [buf_idx, bar_phase] = rs.offset_by(-1).get<NUM_BUFS>();
     
-                        Tensor sS = make_tensor(make_smem_ptr(plan.s), SmemLayoutS{});
-                        Tensor sV = make_tensor(make_smem_ptr(plan.u.qko_slots[buf_idx].data()), SmemLayoutV{});
+                        bf16* sV_base = plan.u.qko_slots[buf_idx].data();
     
                         // Wait for S(i-1) and O to be scaled
                         auto [__, binary_bar_phase] = rs.offset_by(-1).get<1>();
                         plan.bar_so_ready.wait(binary_bar_phase);
                         ku::tcgen05_after_thread_sync();
     
-                        // O += sS @ sV
-                        ku::utcmma_ss(tiled_mma_O, sS, sV, tO, k == 1);
+                        // S to both lane halves, read from smem once (an SS GEMM reads it once a 256-column tile);
+                        // so_ready implies the last S V GEMM, the last reader of tS, is done
+                        CUTE_UNROLL
+                        for (int i = 0; i < B_TOPK/8; ++i)
+                            SM100_UTCCP_2x64dp128bitlw0213_1cta::copy(sS_desc + i*(B_H*8*sizeof(bf16))/16, tmem_cols::S + i*4);
+                        // O += S @ sV, a 256-column half at a time: the first frees V's first half for the next gather
+                        ku::utcmma_ts(tiled_mma_O, tS, make_tensor(make_smem_ptr(sV_base), SmemLayoutVHalf{}), tO_lo, k == 1);
+                        ku::umma_arrive_noelect(plan.bar_sv_lo_done[buf_idx]);
+                        ku::utcmma_ts(tiled_mma_O, tS, make_tensor(make_smem_ptr(sV_base + B_TOPK*D_V/2), SmemLayoutVHalf{}), tO_hi, k == 1);
                         ku::umma_arrive_noelect(plan.bar_sv_done[buf_idx]);
 
                         // The last block: the next job's Q goes out now, into the next row's block-1 buffer (this

@@ -34,5 +34,11 @@ warpgroup (512 threads): thread (lane quadrant q, group g) holds head (q & 1) * 
   response is read there (its barrier's phase is long complete). The next row starts at Q's UTCCP; upstream
   started it at the TMA, and each row boundary waited for Q's 72 KB.
 
+- The S V GEMM reads S from TMEM (columns 480-511, both lane halves, one `tcgen05.cp 64x128b.warpx2::02_13` per
+  8 keys from the smem S the softmax writes), so the smem S is read once a block instead of once per 256-column
+  tile. It runs one 256-column half of O after the other (each element's sum over the keys is the same) and
+  commits the first half on its own barrier, `bar_sv_lo_done`: the producer gathers the next block's first
+  256 dims into that buffer while the second half still runs.
+
 The products, S, `li` and the outputs are upstream's, bit for bit; an exponential whose result would be
 subnormal (below 2^-126) is 0 here.
