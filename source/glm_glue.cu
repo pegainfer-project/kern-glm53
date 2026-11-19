@@ -255,6 +255,7 @@ __device__ __forceinline__ void norm_row(int r, const bf16* __restrict__ a, bf16
 extern "C" __global__ void __launch_bounds__(256) glm_add_rms_quant(
     const bf16* __restrict__ a, bf16* __restrict__ res, const bf16* __restrict__ gamma, bf16* __restrict__ normed,
     u8* __restrict__ q, u8* __restrict__ sf, int sf_rows, int T) {
+  asm volatile("griddepcontrol.launch_dependents;");
   norm_row(blockIdx.x, a, res, gamma, normed, q, sf, sf_rows);
 }
 
@@ -407,9 +408,11 @@ __device__ __forceinline__ void mla_prep(
       u8 *__restrict__ kv, u8 *__restrict__ idx, const bf16 *__restrict__ ik_w, const bf16 *__restrict__ ik_b,   \
       u8 *__restrict__ qq, u8 *__restrict__ qsf, int sf_rows, int T
 extern "C" __global__ void __launch_bounds__(256) glm_mla_prep(MLA_PREP_ARGS) {
+  asm volatile("griddepcontrol.launch_dependents;");
   mla_prep<false>(x, lda, g_q, g_kv, rope, pos, slot, kv, idx, ik_w, ik_b, qq, qsf, sf_rows);
 }
 extern "C" __global__ void __launch_bounds__(256) glm_mla_prep_fp8(MLA_PREP_ARGS) {
+  asm volatile("griddepcontrol.launch_dependents;");
   mla_prep<true>(x, lda, g_q, g_kv, rope, pos, slot, kv, idx, ik_w, ik_b, qq, qsf, sf_rows);
 }
 
@@ -640,6 +643,7 @@ extern "C" __global__ void __launch_bounds__(256) glm_combine_quant(
     const bf16* __restrict__ fc2, const int* __restrict__ exp2perm, const float* __restrict__ wts,
     const bf16* __restrict__ shared, bf16* __restrict__ res, const bf16* __restrict__ gamma, u8* __restrict__ q,
     u8* __restrict__ sf, int sf_rows, int T) {
+  asm volatile("griddepcontrol.launch_dependents;");
   __shared__ int sp[8];
   __shared__ float sw[8];
   const int t = blockIdx.x;

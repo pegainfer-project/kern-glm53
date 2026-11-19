@@ -81,3 +81,4 @@ sub-model -0.04% (graph -0.40%).
 | 43 | 435ddea | the top-k's sample counts its rest only at or above a floor its first eighth puts | 206.52 | 956.35 | 235.95 | -0.17% | 460 | top-1 100.000% · flips 0 (confident 0) |
 | 44 | 05b7d35 | q_pe's rope in q_b's epilogue | 206.07 | 954.89 | 235.46 | -0.21% | 454 | top-1 100.000% · flips 0 (confident 0) |
 | 45 | 2e0d615 | the norms hold a row as packed bf16, five rows an SM | 205.75 | 953.04 | 235.06 | -0.17% | 454 | top-1 100.000% · flips 0 (confident 0) |
+| 46 | f6a3899 | norms, mla_prep and combine_quant trigger the PDL GEMM after them early | 205.52 | 953.25 | 234.84 | -0.10% | 454 | top-1 100.000% · flips 0 (confident 0) |
