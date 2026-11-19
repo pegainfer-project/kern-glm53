@@ -88,26 +88,33 @@ def mla_entry():
 # the routed GEMMs' layout by row count (DeepGEMM's m-grouped choice: swap-AB, BN 128, a 2-CTA cluster), block M
 # 256 once an expert averages more than 128 rows
 MOE_TILES = "4096:s128,16384:s256"
-# the dense GEMMs' layouts by row count, as moe_layouts reads them (s: swap-AB with that block M on a 2-CTA
-# cluster, n: that BN, m: BN 256 on a 2-CTA cluster multicasting the weight tile): at few rows each puts more
-# CTAs on its weight (fp8.o at 128 rows: 96 tiles of 128 weight rows x 64 tokens, not 24 of 128 x 256); from
-# 257 rows the multicast halves the L2 traffic of the weight tiles that bound the plain BN 256 tile
-TILES = {"o": "256:s64,16384:m", "dense.gu": "256:n,16384:m", "dense.dn": "512:s64,16384:m",
-         "a.full": "256:n32,16384:n", "a.shared": "256:n32,16384:n", "b.full": "256:n,16384:m",
-         "b.shared": "256:n128,16384:m"}
+# the dense GEMMs' layouts by row count, as tile_ranges reads them (s: swap-AB with that block M on a 2-CTA
+# cluster, n: that BN, m: that BN (256 if none) on a 2-CTA cluster multicasting the weight tile): at few rows each
+# puts more CTAs on its weight (fp8.o at 128 rows: 96 tiles of 128 weight rows x 64 tokens, not 24 of 128 x 256);
+# from 257 rows the multicast halves the L2 traffic of the weight tiles that bound the plain BN 256 tile, its BN
+# the one whose tiles fill the 152 SMs' last wave best (q_a at 2048 rows: 16 x 19 tiles of BN 144 are two full
+# waves, 16 x 21 of BN 128 three with the last a fifth full)
+TILES = {"o": "256:s64,1024:m176,8192:m224,16384:m192", "dense.gu": "256:n,16384:m",
+         "dense.dn": "512:s64,16384:m224", "a.full": "256:n32,1024:m96,16384:m160",
+         "a.shared": "256:n32,1024:m96,16384:m144", "b.full": "256:n,16384:m", "b.shared": "256:n128,16384:m"}
 
 
 def moe_layouts(spec, chunk):
     """`--moe-tiles` as [(when, block M or None)]: "512:s32,16384:n" runs swap-AB block M 32 up to 512 rows, then
     the plain BN-by-128 tile (block M 128) up to 16384."""
+    return [(w, t) for _, w, t in tile_ranges(spec, chunk)]
+
+
+def tile_ranges(spec, chunk):
+    """A layout spec as [(kind, when, number or None)], the ranges past `chunk` dropped."""
     out, lo = [], 1
     for part in spec.split(","):
         hi, cfg = part.split(":")
         hi = min(int(hi), chunk)
         if lo <= hi:
-            out.append(({"var": T, "min": lo, "max": hi}, int(cfg[1:]) if cfg[1:] else None))
+            out.append((cfg[:1], {"var": T, "min": lo, "max": hi}, int(cfg[1:]) if cfg[1:] else None))
         lo = hi + 1
-    assert lo > chunk, "the MoE layouts cover every row count"
+    assert lo > chunk, "the layouts cover every row count"
     return out
 
 
@@ -218,10 +225,9 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
             ls = [G.fp8_gemm(*a, swap_bm=bm, when=w, tiled=True) for w, bm in layouts]
             ops["fp8." + k] = {"params": ls[0][1], "impl": {"launches": [l for l, _ in ls]}}
         elif k in TILES:
-            kinds = [part.split(":")[1][:1] for part in TILES[k].split(",")]
-            ls = [G.fp8_gemm(*a, **({"swap_bm": t} if kind == "s" else {"mcb": True} if kind == "m" else {"bn": t}),
+            ls = [G.fp8_gemm(*a, **({"swap_bm": t} if kind == "s" else {"mcb": t or 256} if kind == "m" else {"bn": t}),
                              acc=k == "o", when=w)
-                  for kind, (w, t) in zip(kinds, moe_layouts(TILES[k], chunk))]
+                  for kind, w, t in tile_ranges(TILES[k], chunk)]
             ops["fp8." + k] = {"params": ls[0][1], "impl": {"launches": [l for l, _ in ls]}}
         else:
             ops["fp8." + k] = G.fp8_op(*a)

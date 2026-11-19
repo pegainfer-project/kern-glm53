@@ -57,6 +57,9 @@ def nulled(mod, entry, params, null, grid, block):
 
 # ---- DeepGEMM sm100 fp8 1d1d: e4m3 x e4m3 -> bf16, UE8M0 scales packed four to an i32 (MN-major)
 FP8_TILE = {32: (10, 232448), 64: (7, 212992), 128: (5, 202752), 256: (3, 185344)}  # BN -> (stages, shared memory)
+# BN -> (C/D swizzle, stages, shared memory) of the 2-CTA multicast tile (source/glm_fp8_tiles.cu)
+FP8_MCB_TILE = {256: (128, 5, 204800), 224: (64, 6, 210944), 192: (128, 6, 215040), 176: (32, 7, 212992),
+                160: (64, 7, 214016), 144: (32, 8, 226304), 96: (64, 9, 229376)}
 # swap-AB, BN 128 over a 2-CTA cluster: BM -> (stages, shared memory) (source/glm_deepgemm.cu, glm_fp8_tiles.cu)
 FP8_SWAP_TILE = {32: (11, 223232), 64: (10, 224256), 128: (8, 214016), 256: (6, 215040)}
 FP8_ENTRY = ("_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj128ELj128ELj0ELj0ELj0"
@@ -73,7 +76,7 @@ def fp8_gemm(n, k, rows, lda, ldc, sfa_rows, groups=1, bn=None, swap_bm=None, mc
     rows at g * n, its scale words at g * k / 512). The tensor maps span `rows` rows of A and C.
     `swap_bm`: swap-AB with that block M (grouped: the psum alignment), BN 128, a 2-CTA cluster; `tiled` with it
     (grouped): W tile-major (glm_requant_tiled's 64-row x 128-byte tiles), source/dg/glm_moe_dn.cuh's copy.
-    `mcb`: BN 256 on a 2-CTA cluster along M multicasting the weight tile (source/glm_fp8_tiles.cu); the
+    `mcb`: that BN on a 2-CTA cluster along M multicasting the weight tile (source/glm_fp8_tiles.cu); the
     pair needs an even count of 128-row blocks (DeepGEMM's multicast legality), so it runs m rounded up to
     256 rows, its extra rows inside the `rows` the maps span and read by no one.
     `acc` (swap_bm 64 or mcb): C += the product, the bf16 rounded product added by a TMA reduce-add."""
@@ -84,9 +87,9 @@ def fp8_gemm(n, k, rows, lda, ldc, sfa_rows, groups=1, bn=None, swap_bm=None, mc
         stages, smem = FP8_SWAP_TILE[bm]
         a_box, sfa_box, swz, cd_box = [128, bm // mc], [-(-bm // 128) * 128, 1], 128, [64, 16]
     elif mcb:
-        bm, bn, mc, swz = 128, 256, 2, 128
-        stages, smem = 5, 204800
-        a_box, sfa_box, cd_box = [128, 128], [128, 1], [64, 128]
+        bm, bn, mc = 128, mcb, 2
+        swz, stages, smem = FP8_MCB_TILE[bn]
+        a_box, sfa_box, cd_box = [128, 128], [128, 1], [swz // 2, 128]
     else:
         bm, mc = 128, 1
         bn = bn or (256 if n >= 4096 and n % 256 == 0 else 128)
@@ -105,7 +108,7 @@ def fp8_gemm(n, k, rows, lda, ldc, sfa_rows, groups=1, bn=None, swap_bm=None, mc
             desc(tm(0, 1, "u8", [128, 64, n * groups // 64 * (k // 128)], [128, 8192], [128, 64, 1], 128) if tiled else
                  tm(0, 1, "u8", [k, n * groups], [k], [128, bn // 2 if mcb else bn], 128)),
             desc(tm(0, 2, "i32", [sfa_rows, kw], [sfa_rows * 4], sfa_box)),
-            desc(tm(0, 3, "i32", [n, kw * groups], [n * 4], [max(bn, 128), 1])),
+            desc(tm(0, 3, "i32", [n, kw * groups], [n * 4], [-(-bn // 128) * 128, 1])),
             desc(tm(0, 4, "bf16", [n, rows], [ldc * 2], cd_box, swz))]
     assert not mcb or rows % 256 == 0
     m = {"pack": {"size": 4, "fields": [{"at": 0, "expr": {"mul": [{"ceil_div": [T, 256]}, 256]}}]}} if mcb else \
