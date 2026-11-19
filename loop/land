@@ -3,7 +3,7 @@
 #
 # Cherry-picks SHA without committing (a conflict only in kernels.toml takes SHA's side hunk by hunk), builds and repins, generates the sub-model, A/Bs main's base
 # against it (loop/ab, two pairs) and runs the numerics gate against main (loop/longcheck). Prints both. Then,
-# only with LAND=1 and the gate passing (all lower by 0.1% or fewer launches, short and long not up beyond 0.3%, longcheck inside
+# only with LAND=1 and the gate passing (all lower by 0.1%, or fewer launches and all not up, short and long not up beyond 0.3%, longcheck inside
 # TASK.md's floor): appends the HISTORY.md row (main's commit it lands after, the row above times the A/B's B/A ratio per scenario,
 # Δ all the A/B's own, launches, the gate's long line, NOTE) and commits the pick with SHA's message and author; main's base moves to it
 # (manifests, bench report, recordings). Without LAND=1 the pick is left staged for a look; `git reset --hard`
@@ -60,8 +60,8 @@ def within(name):
     m = re.search(rf"^{name} +positions \d+ · top-1 ([\d.]+)% · flips \d+ \(confident (\d+)\) · \|dlp\| mean ([\d.]+)", lc, re.M)
     top1, conf, dlp = floor[name]
     return bool(m) and float(m[1]) >= top1 and int(m[2]) <= conf and float(m[3]) <= dlp
-fewer = len(sys.argv) > 3 and int(sys.argv[3]) < int(sys.argv[4])
-why = [w for w, bad in [("all not lower by 0.1% (and launches not fewer)", d.get("all", 0) > -0.1 and not fewer), ("short up", d.get("short", 0) > 0.3),
+fewer = len(sys.argv) > 3 and int(sys.argv[3]) < int(sys.argv[4]) and d.get("all", 0) <= 0
+why = [w for w, bad in [("all not lower by 0.1% (and not fewer launches at no cost)", d.get("all", 0) > -0.1 and not fewer), ("short up", d.get("short", 0) > 0.3),
                         ("long up", d.get("long", 0) > 0.3), ("long outside the floor", not within("long")),
                         ("short outside the floor", not within("short"))] if bad]
 print("gate: " + ("pass" if not why else "; ".join(why)))
