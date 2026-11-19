@@ -9,12 +9,14 @@
 //        gate-up one writing act = e4m3(bf16(silu(gate) * up)) with its UE8M0 scales instead of bf16;
 //   bf16: batched bhr,hdr->bhd over the 64 heads, MLA's q absorption and v up-projection;
 //   mqa logits: the lightning indexer's fp8 scores, 32 heads of 128, bf16 head weights and the heads' relu sum
-//        in bf16 into compressed bf16 logits (vLLM's bf16 indexer logits on SM100), its (8-row q block, 256-key
+//        in bf16 into compressed bf16 logits (vLLM's bf16 indexer logits on SM100), its (16-row q block, 256-key
 //        split) work spread evenly over the SMs by DeepGEMM's metadata kernel (every sub-chunk of a call in one
-//        launch, a block each), two math warpgroups a split, an MMA of N 256 each (source/dg/README.md).
+//        launch, a block each), a split's keys read once for MMAs of N 256 over both 8-row halves, two math
+//        warpgroups (source/dg/glm_mqa_logits.cuh); below 32k keys of context the vendored kernel's 8-row block.
 #include <deep_gemm/impls/sm100_fp8_fp4_gemm_1d1d.cuh>
 #include <deep_gemm/impls/sm100_bf16_gemm.cuh>
 #include "dg/sm100_mqa_logits.cuh"
+#include "dg/glm_mqa_logits.cuh"
 #include "dg/sm100_mqa_logits_metadata.cuh"
 #include "dg/glm_moe_gu_silu.cuh"
 #include "dg/glm_moe_dn.cuh"
@@ -110,5 +112,10 @@ void glm_instantiate() {
                                                        128, 256, e4m3, __nv_bfloat16, __nv_bfloat16>);
     asm volatile("" ::"l"(p)); }
   { auto p = reinterpret_cast<void*>(&sched::sm100_mqa_logits_metadata_batched<8, 256, 152, 1, 1, 15>);
+    asm volatile("" ::"l"(p)); }
+  static_assert(sizeof(layout::MQALogitsSharedStorage<32, 128, false, 16, 256, 1, 4, 2, e4m3, __nv_bfloat16>) == 202752);
+  { auto p = reinterpret_cast<void*>(&glm_mqa_logits<16, 256, 4, 152>);
+    asm volatile("" ::"l"(p)); }
+  { auto p = reinterpret_cast<void*>(&sched::sm100_mqa_logits_metadata_batched<16, 256, 152, 1, 1, 15>);
     asm volatile("" ::"l"(p)); }
 }

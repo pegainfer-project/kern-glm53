@@ -211,22 +211,31 @@ def vup_quant(n, k, rows, a, b):
                                       when={"var": T, "min": MC_ROWS + 1})]}}
 
 
-# ---- the lightning indexer over one sub-chunk of R rows: DeepGEMM's metadata kernel deals the (8-row q block, 256-key
-# split) work evenly over the SMs, its fp8 MQA logits follow it on two math warpgroups, a split's 256 keys one TMA tile
-# (bf16, compressed: row r's logits at [r][0, ke - ks)),
+# ---- the lightning indexer over one sub-chunk of R rows: DeepGEMM's metadata kernel deals the (q block, 256-key split)
+# work evenly over the SMs, the fp8 MQA logits follow it on two math warpgroups, a split's 256 keys one TMA tile read by
+# MMAs of N 256 over each 8 rows of the block (bf16, compressed: row r's logits at [r][0, ke - ks)),
 # then each row's top-k (glm_topk: vLLM's set, ascending, the same bytes every run; a row of at most 32k read once, a
 # longer one's sample and then the row read once against a threshold)
-MQA_ENTRY = ("_ZN9deep_gemm16sm100_mqa_logitsILj32ELj128ELb0ELb1ELb0ELb1ELj8ELj256ELj2ELj4ELj152ELj128ELj256E"
-             "N7cutlass12float_e4m3_tE13__nv_bfloat16S3_Lj2EEEvjjjPKjS5_S5_PT13_14CUtensorMap_stS8_S8_S8_S8_")
-META_ENTRY = "_ZN9deep_gemm5sched33sm100_mqa_logits_metadata_batchedILj8ELj256ELj152ELj1ELj1ELj15EEEvjjjPKjS3_Pjj"
+# (8-row q block, the vendored kernel) up to LONG keys of context, (16-row, glm_mqa_logits) from LONG: a long context's
+# split read once for 16 rows pays more than the 16-row block's fewer work items cost a short one
+LONG = 32768
+TILINGS = [
+    ({"max": LONG - 1}, 8,
+     "_ZN9deep_gemm16sm100_mqa_logitsILj32ELj128ELb0ELb1ELb0ELb1ELj8ELj256ELj2ELj4ELj152ELj128ELj256E"
+     "N7cutlass12float_e4m3_tE13__nv_bfloat16S3_Lj2EEEvjjjPKjS5_S5_PT13_14CUtensorMap_stS8_S8_S8_S8_",
+     "_ZN9deep_gemm5sched33sm100_mqa_logits_metadata_batchedILj8ELj256ELj152ELj1ELj1ELj15EEEvjjjPKjS3_Pjj"),
+    ({"min": LONG}, 16,
+     "_ZN9deep_gemm14glm_mqa_logitsILj16ELj256ELj4ELj152EEEvjjjPKjS2_S2_P13__nv_bfloat1614CUtensorMap_stS5_S5_S5_S5_",
+     "_ZN9deep_gemm5sched33sm100_mqa_logits_metadata_batchedILj16ELj256ELj152ELj1ELj1ELj15EEEvjjjPKjS3_Pjj"),
+]
 TOPK = 2048
 TOPK_SMEM = 93408  # sizeof(Smem) of source/k31/k31_topk.cu
-BLOCK_Q, SPLIT_KV = 8, 256
+MMA_ROWS, SPLIT_KV = 8, 256
 
 
 def meta_words(r):
-    """The schedule's i32 words: per-SM starts and counts, then a (base, splits) span per q block."""
-    return (3 * SMS + 1) // 2 * 2 + 2 * -(-r // BLOCK_Q)
+    """The schedule's i32 words: per-SM starts and counts, then a (base, splits) span per q block (8-row, the most)."""
+    return (3 * SMS + 1) // 2 * 2 + 2 * -(-r // MMA_ROWS)
 
 
 def indexer(j, r, kv_cap, pick_rows):
@@ -236,21 +245,23 @@ def indexer(j, r, kv_cap, pick_rows):
     stream offset the picks take on), tlen i32 out, the pick flags u8 [ctx] (set by calls of at most pick_rows
     rows) and the call's rows. Every row pointer is the call's, offset to the sub-chunk's first row; the logits
     are the sub-chunk's own, the schedule its slice."""
-    when = {"var": T, "min": j * r + 1}
     sf = tm(0, 2, "f32", [kv_cap, 1], [kv_cap * 4], [SPLIT_KV, 1])
-    maps = [desc(tm(0, 0, "u8", [128, r * 32], [128], [128, BLOCK_Q * 32], 128)), desc(sf),
-            desc(tm(0, 1, "u8", [128, kv_cap], [128], [128, SPLIT_KV], 128)), desc(sf),
-            desc(tm(0, 3, "bf16", [32, r], [64], [32, BLOCK_Q], 0))]
-    # sub-chunk 0 schedules the call's every sub-chunk, a block each, into its own slice of the schedule
-    meta = [launch("glm_deepgemm", META_ENTRY, [{"ceil_div": [T, r]}, 1, 1], [256, 1, 1], 8 * -(-r // BLOCK_Q),
+    maps = lambda rows: [desc(tm(0, 0, "u8", [128, r * 32], [128], [128, MMA_ROWS * 32], 128)), desc(sf),
+                         desc(tm(0, 1, "u8", [128, kv_cap], [128], [128, SPLIT_KV], 128)), desc(sf),
+                         desc(tm(0, 3, "bf16", [32, r], [64], [32, rows], 0))]
+    # sub-chunk 0 schedules the call's every sub-chunk, a block each, into its own slice of the schedule; a sub-chunk
+    # past the call's rows launches no block (its tiling goes by the context)
+    meta = [launch("glm_deepgemm", meta_entry, [{"ceil_div": [T, r]}, 1, 1], [256, 1, 1], 8 * -(-r // rows),
                    params=["i32", "i32", "i32", "in buffer<u32>", "in buffer<u32>", "out buffer<i32>", "i32"],
                    args=[{"param": 17}, {"i32": r}, {"param": 11}, {"param": 4}, {"param": 5}, {"param": 13},
-                         {"i32": meta_words(r)}], when=when, pdl=True)] if j == 0 else []
-    mqa = launch("glm_deepgemm", MQA_ENTRY, [SMS, 1, 1], [384, 1, 1], 202752,
-                 params=["i32", "i32", "i32", "in buffer<u32>", "in buffer<u32>", "in buffer<i32>", "out buffer<bf16>",
-                         *["bytes<128>"] * 5],
-                 args=[{"param": 10}, {"param": 11}, {"param": 12}, {"param": 4}, {"param": 5}, {"param": 13},
-                       {"param": 8}, *maps], when=when, pdl=True)
+                         {"i32": meta_words(r)}], when={"var": "ctx", **ctx}, pdl=True)
+            for ctx, rows, _, meta_entry in TILINGS] if j == 0 else []
+    mqa = [launch("glm_deepgemm", entry, [{"mul": [{"clamp": [T, j * r, 1]}, SMS]}, 1, 1], [384, 1, 1], 202752,
+                  params=["i32", "i32", "i32", "in buffer<u32>", "in buffer<u32>", "in buffer<i32>", "out buffer<bf16>",
+                          *["bytes<128>"] * 5],
+                  args=[{"param": 10}, {"param": 11}, {"param": 12}, {"param": 4}, {"param": 5}, {"param": 13},
+                        {"param": 8}, *maps(rows)], when={"var": "ctx", **ctx}, pdl=True)
+           for ctx, rows, entry, _ in TILINGS]
     topk_params = ["in buffer<bf16>", "i32", "in buffer<i32>", "out buffer<i32>", "in buffer<u32>", "out buffer<i32>",
                    "inout buffer<u8>"]
     topk_args = [{"param": 8}, {"param": 12}, {"param": 7}, {"param": 9}, {"param": 14}, {"param": 15}, {"param": 16}]
@@ -263,7 +274,7 @@ def indexer(j, r, kv_cap, pick_rows):
                        "in buffer<u32>", "in buffer<i32>", "in buffer<i32>", "out buffer<bf16>", "out buffer<i32>",
                        "i32", "i32", "i32", "out buffer<i32>" if j == 0 else "in buffer<i32>", "in buffer<u32>",
                        "out buffer<i32>", "inout buffer<u8>", "i32"],
-            "impl": {"launches": [*meta, mqa, *topks]}}
+            "impl": {"launches": [*meta, *mqa, *topks]}}
 
 
 # ---- FlashMLA sm100 sparse prefill, 64 heads, d_qk 576 (512 latent | 64 rope), d_v 512

@@ -64,3 +64,4 @@ SGLang's prompt logprobs (its fp8-KV run), and against the checkpoint before.
 | 38 | db1d156 | indexer logits: 8-row q blocks on two math warpgroups, an MMA of N 256 each | 208.56 | 966.34 | 238.25 | -0.62% | 415 | top-1 100.000% · flips 0 (confident 0) |
 | 39 | 974f213 | flash_mla's S V GEMM reads S from TMEM, frees V's first half after its first 256 columns | 208.18 | 963.81 | 237.78 | -0.20% | 415 | top-1 100.000% · flips 0 (confident 0) |
 | 40 | 70976fb | flash_mla's K gathers from three producer warps, none from the MMA warp's sub-partition | 207.51 | 959.27 | 236.96 | -0.34% | 415 | top-1 100.000% · flips 0 (confident 0) |
+| 41 | b50c880 | from 32k keys of context the indexer's logits read a split once for a 16-row q block | 207.20 | 958.29 | 236.62 | -0.14% | 460 | top-1 100.000% · flips 0 (confident 0) |
