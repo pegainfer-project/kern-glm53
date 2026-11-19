@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # loop/ab A B OUT [N]: A/B of two sub-model manifests on one leased GPU, A B B A A B ... N pairs (default 2), so both
 # sides see the same GPU, clocks and power cap. Writes OUT/{a,b}-<i>.{json,log}; prints each run's loop/score and
-# the per-scenario medians. Separate loop/bench calls can land on GPUs a few percent apart, more than most changes.
+# the per-scenario medians; a bench past 15 minutes is killed where it runs (a hang fails the A/B instead of
+# keeping the GPU). Separate loop/bench calls can land on GPUs a few percent apart, more than most changes.
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 a=$(realpath "$1") b=$(realpath "$2") out=$(realpath -m "$3") n=${4:-2}
 mkdir -p "$out"
 cd "$LOOP_DIR"
-bench="env KERN_CACHE_DIR=$KERN_CACHE_DIR LD_LIBRARY_PATH=$LD_LIBRARY_PATH $GLM_KERN_BIN bench --kernels $REPO/build \
+bench="timeout -k 30 900 env KERN_CACHE_DIR=$KERN_CACHE_DIR LD_LIBRARY_PATH=$LD_LIBRARY_PATH $GLM_KERN_BIN bench --kernels $REPO/build \
 --weights $GLM_WEIGHTS --tokenizer $GLM_WEIGHTS/tokenizer.json --gpu 0 --workload $LOOP_DIR/workload.toml"
 runs=""
 for i in $(seq 1 "$n"); do
