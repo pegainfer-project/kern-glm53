@@ -333,7 +333,7 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
     work("ksf", [max_ctx], "f32")
     work("pick", [max_ctx], "u8")
     work("logits", [sub * max_ctx])
-    work("imeta", [G.meta_words(sub)], "i32")
+    work("imeta", [chunk // sub * G.meta_words(sub)], "i32")
     work("ind", [T, G.TOPK], "i32")
     if fp8kv:
         work("kvd", [max_ctx, MLA])
@@ -454,7 +454,8 @@ def build(layers, chunk, pack, max_ctx, sub, cuts, kv_dtype="fp8", first=0, moe_
                      buf("wout", r0 * IH * 2), buf("ks", r0 * 4), buf("ke", r0 * 4), buf("zero", r0 * 4),
                      buf("klen", r0 * 4), buf("logits"), buf("ind", r0 * G.TOPK * 4),
                      expr({"clamp": [T, r0, sub]}), var(CTX), expr({"mul": [{"ceil_div": [CTX, 256]}, 256]}),
-                     buf("imeta"), buf("ks" if fp8kv else "zero", r0 * 4), buf("tlen", r0 * 4), buf("pick"))
+                     buf("imeta", j * G.meta_words(sub) * 4), buf("ks" if fp8kv else "zero", r0 * 4), buf("tlen", r0 * 4),
+                     buf("pick"), var(T))
             if not fp8kv:
                 step(n + "topk_slots", "topk_slots", buf("ind"), buf("block_table"), i32(max_pages), buf("row_seq"),
                      buf("klen"), buf("tlen"), var(T))

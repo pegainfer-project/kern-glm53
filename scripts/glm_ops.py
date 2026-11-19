@@ -209,7 +209,7 @@ def vup_quant(n, k, rows, a, b):
 # longer one's sample and then the row read once against a threshold)
 MQA_ENTRY = ("_ZN9deep_gemm16sm100_mqa_logitsILj32ELj128ELb0ELb1ELb0ELb1ELj4ELj384ELj3ELj3ELj152ELj128ELj384E"
              "N7cutlass12float_e4m3_tE13__nv_bfloat16S3_Lj3EEEvjjjPKjS5_S5_PT13_14CUtensorMap_stS8_S8_S8_S8_")
-META_ENTRY = "_ZN9deep_gemm5sched25sm100_mqa_logits_metadataILj4ELj384ELj152ELj1ELj1ELj15EEEvjjPKjS3_Pj"
+META_ENTRY = "_ZN9deep_gemm5sched33sm100_mqa_logits_metadata_batchedILj4ELj384ELj152ELj1ELj1ELj15EEEvjjjPKjS3_Pjj"
 TOPK = 2048
 TOPK_SMEM = 93408  # sizeof(Smem) of source/k31/k31_topk.cu
 BLOCK_Q = 4
@@ -223,17 +223,20 @@ def meta_words(r):
 def indexer(j, r, kv_cap, pick_rows):
     """Interface: iq [., 32, 128] u8, kg [kv_cap, 128] u8, ksf [kv_cap] f32, w [., 32] bf16, ks, ke u32,
     zero, klen i32, logits bf16, ind i32 [., 2048] out, then num_q, num_kv, stride, the schedule
-    [meta_words(r)] i32 out, then base u32 (the stream offset the picks take on), tlen i32 out and the pick
-    flags u8 [ctx] (set by calls of at most pick_rows rows). Every row pointer is the call's, offset to the
-    sub-chunk's first row; the logits and the schedule are the sub-chunk's own."""
+    [meta_words(r)] i32 (sub-chunk 0 writes the call's every sub-chunk's, one after another), then base u32 (the
+    stream offset the picks take on), tlen i32 out, the pick flags u8 [ctx] (set by calls of at most pick_rows
+    rows) and the call's rows. Every row pointer is the call's, offset to the sub-chunk's first row; the logits
+    are the sub-chunk's own, the schedule its slice."""
     when = {"var": T, "min": j * r + 1}
     sf = tm(0, 2, "f32", [kv_cap, 1], [kv_cap * 4], [128, 1])
     maps = [desc(tm(0, 0, "u8", [128, r * 32], [128], [128, 128], 128)), desc(sf),
             desc(tm(0, 1, "u8", [128, kv_cap], [128], [128, 128], 128)), desc(sf),
             desc(tm(0, 3, "bf16", [32, r], [64], [32, 4], 0))]
-    meta = launch("glm_deepgemm", META_ENTRY, [1, 1, 1], [256, 1, 1], 8 * -(-r // BLOCK_Q),
-                  params=["i32", "i32", "in buffer<u32>", "in buffer<u32>", "out buffer<i32>"],
-                  args=[{"param": 10}, {"param": 11}, {"param": 4}, {"param": 5}, {"param": 13}], when=when, pdl=True)
+    # sub-chunk 0 schedules the call's every sub-chunk, a block each, into its own slice of the schedule
+    meta = [launch("glm_deepgemm", META_ENTRY, [{"ceil_div": [T, r]}, 1, 1], [256, 1, 1], 8 * -(-r // BLOCK_Q),
+                   params=["i32", "i32", "i32", "in buffer<u32>", "in buffer<u32>", "out buffer<i32>", "i32"],
+                   args=[{"param": 17}, {"i32": r}, {"param": 11}, {"param": 4}, {"param": 5}, {"param": 13},
+                         {"i32": meta_words(r)}], when=when, pdl=True)] if j == 0 else []
     mqa = launch("glm_deepgemm", MQA_ENTRY, [SMS, 1, 1], [512, 1, 1], 202752,
                  params=["i32", "i32", "i32", "in buffer<u32>", "in buffer<u32>", "in buffer<i32>", "out buffer<bf16>",
                          *["bytes<128>"] * 5],
@@ -249,8 +252,9 @@ def indexer(j, r, kv_cap, pick_rows):
     topks = ([topk(j * r + 1, pick_rows, True)] if j * r < pick_rows else []) + [topk(max(j * r, pick_rows) + 1, 0, False)]
     return {"params": ["in buffer<u8>", "in buffer<u8>", "in buffer<f32>", "in buffer<bf16>", "in buffer<u32>",
                        "in buffer<u32>", "in buffer<i32>", "in buffer<i32>", "out buffer<bf16>", "out buffer<i32>",
-                       "i32", "i32", "i32", "out buffer<i32>", "in buffer<u32>", "out buffer<i32>", "inout buffer<u8>"],
-            "impl": {"launches": [meta, mqa, *topks]}}
+                       "i32", "i32", "i32", "out buffer<i32>" if j == 0 else "in buffer<i32>", "in buffer<u32>",
+                       "out buffer<i32>", "inout buffer<u8>", "i32"],
+            "impl": {"launches": [*meta, mqa, *topks]}}
 
 
 # ---- FlashMLA sm100 sparse prefill, 64 heads, d_qk 576 (512 latent | 64 rope), d_v 512
